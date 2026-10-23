@@ -179,7 +179,15 @@ class AegisSecurityPlugin : Plugin() {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK
         }
 
-        val browserPkg = context.packageManager.queryIntentActivities(viewIntent, 0)
+        val browserPkg = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            context.packageManager.queryIntentActivities(
+                viewIntent,
+                android.content.pm.PackageManager.ResolveInfoFlags.of(0)
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.queryIntentActivities(viewIntent, 0)
+        }
             .map { it.activityInfo.packageName }
             .firstOrNull { it != context.packageName }
 
@@ -231,7 +239,11 @@ class AegisSecurityPlugin : Plugin() {
         }
         pluginScope.launch {
             val stored = encryptedStore.getEncryptedString(key)
-            call.resolve(JSObject().apply { put("value", stored) })
+            call.resolve(
+                JSObject().apply {
+                    if (stored != null) put("value", stored) else put("value", JSObject.NULL)
+                }
+            )
         }
     }
 
@@ -243,8 +255,8 @@ class AegisSecurityPlugin : Plugin() {
         pendingCallerPackage = null
         call.resolve(
             JSObject().apply {
-                put("interceptedUrl", url)
-                put("callerPackage", caller)
+                if (url != null) put("interceptedUrl", url) else put("interceptedUrl", JSObject.NULL)
+                if (caller != null) put("callerPackage", caller) else put("callerPackage", JSObject.NULL)
             }
         )
     }

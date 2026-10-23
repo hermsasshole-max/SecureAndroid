@@ -1,6 +1,5 @@
 package com.aegislocal.security.links
 
-import android.icu.text.SpoofChecker
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import kotlinx.coroutines.Dispatchers
@@ -8,17 +7,13 @@ import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.IDN
 import java.net.URI
+import java.text.Normalizer
 
 /**
- * Non-rendering HTTP HEAD redirect chain resolver + Android ICU SpoofChecker
- * homograph verifier. Never loads untrusted URLs inside a WebView.
+ * Non-rendering HTTP HEAD redirect chain resolver + public SDK IDN & UnicodeScript
+ * mixed-script homograph verifier. Never loads untrusted URLs inside a WebView.
  */
 class UrlThreatAnalyzer {
-
-    private val spoofChecker: SpoofChecker = SpoofChecker.Builder()
-        .setRestrictionLevel(SpoofChecker.RestrictionLevel.MODERATELY_RESTRICTIVE)
-        .setChecks(SpoofChecker.RESTRICTION_LEVEL or SpoofChecker.MIXED_NUMBERS)
-        .build()
 
     suspend fun expandRedirectChain(rawUrl: String, maxHops: Int = 6): JSObject =
         withContext(Dispatchers.IO) {
@@ -72,16 +67,43 @@ class UrlThreatAnalyzer {
                 }
             }
 
-            val host = runCatching { URI.create(currentUrl).host.orEmpty() }.getOrDefault("")
+            val host = runCatching { URI.create(currentUrl).host.orEmpty().lowercase() }.getOrDefault("")
             val unicodeHost = runCatching { IDN.toUnicode(host, IDN.ALLOW_UNASSIGNED) }.getOrDefault(host)
-            val icuFlagged = host.isNotEmpty() && spoofChecker.failsChecks(unicodeHost)
+            val homographFlagged = host.isNotEmpty() && hasDeceptiveUnicodeScript(host, unicodeHost)
 
             JSObject().apply {
                 put("mode", "android-native-head")
                 put("initialUrl", rawUrl)
                 put("finalUrl", currentUrl)
-                put("icuSpoofFlagged", icuFlagged)
+                put("icuSpoofFlagged", homographFlagged)
                 put("hops", hopsArray)
             }
         }
+
+    /**
+     * Uses public java.lang.Character.UnicodeScript + Normalizer (API 24+) to flag
+     * mixed-script Latin/Cyrillic/Greek labels and Punycode confusables without hidden APIs.
+     */
+    private fun hasDeceptiveUnicodeScript(asciiHost: String, unicodeHost: String): Boolean {
+        if (asciiHost.contains("xn--")) return true
+        val normalized = Normalizer.normalize(unicodeHost, Normalizer.Form.NFKC)
+        for (label in normalized.split('.')) {
+            if (label.isEmpty()) continue
+            val scripts = mutableSetOf<Character.UnicodeScript>()
+            var i = 0
+            while (i < label.length) {
+                val cp = label.codePointAt(i)
+                val script = Character.UnicodeScript.of(cp)
+                if (script != Character.UnicodeScript.COMMON && script != Character.UnicodeScript.INHERITED) {
+                    scripts += script
+                }
+                i += Character.charCount(cp)
+            }
+            if (scripts.size > 1) return true
+            if (Character.UnicodeScript.CYRILLIC in scripts || Character.UnicodeScript.GREEK in scripts) {
+                return true
+            }
+        }
+        return false
+    }
 }

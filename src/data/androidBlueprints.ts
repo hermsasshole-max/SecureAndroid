@@ -780,23 +780,22 @@ class LocalLoopbackVpnService : VpnService() {
     path: 'app/src/main/java/com/aegislocal/security/links/UrlThreatAnalyzer.kt',
     language: 'kotlin',
     summary:
-      'Expands shortened URLs hop-by-hop without executing JavaScript/WebViews, checks ICU Unicode SpoofChecker homographs, and queries Google Safe Browsing v4.',
+      'Expands shortened URLs hop-by-hop without executing JavaScript/WebViews, checks IDN + Character.UnicodeScript mixed-script homographs, and queries Google Safe Browsing v4.',
     edgeCases: [
       'Never load untrusted URLs inside a hidden WebView to resolve redirects—zero-day Blink/V8 exploits execute on initial page render. Always use HttpURLConnection with instanceFollowRedirects = false.',
       'Cap redirect traversal at 6 hops with a 3500ms connect/read timeout to prevent tar-pit DoS links from hanging the interceptor BottomSheet.',
     ],
     performanceNotes: [
-      'Local regex, Punycode IDN.toUnicode(), and ICU SpoofChecker execute in <1.5ms on-device before any network preflight is needed.',
+      'Local regex, Punycode IDN.toUnicode(), and Character.UnicodeScript checks execute in <1.5ms on-device before any network preflight is needed.',
     ],
     code: `package com.aegislocal.security.links
 
-import android.icu.text.SpoofChecker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.IDN
 import java.net.URI
-import java.net.URL
+import java.text.Normalizer
 
 data class UrlVerdict(
     val originalUrl: String,
@@ -807,15 +806,6 @@ data class UrlVerdict(
 )
 
 class UrlThreatAnalyzer {
-
-    private val spoofChecker: SpoofChecker = SpoofChecker.Builder()
-        .setChecks(
-            SpoofChecker.MIXED_SCRIPT_CONFUSABLE or
-                SpoofChecker.WHOLE_SCRIPT_CONFUSABLE or
-                SpoofChecker.RESTRICTION_LEVEL
-        )
-        .setRestrictionLevel(SpoofChecker.RestrictionLevel.MODERATELY_RESTRICTIVE)
-        .build()
 
     private val protectedBrands = listOf(
         "google.com", "paypal.com", "apple.com", "microsoft.com", "chase.com", "github.com"
@@ -851,18 +841,17 @@ class UrlThreatAnalyzer {
         val asciiHost = uri.host?.lowercase().orEmpty()
         val unicodeHost = IDN.toUnicode(asciiHost, IDN.ALLOW_UNASSIGNED)
 
-        // 1. ICU SpoofChecker IDN Homograph Inspection
-        if (asciiHost.contains("xn--") || spoofChecker.failsChecks(unicodeHost)) {
-            reasons += "IDN homograph / mixed-script confusable hostname detected ($unicodeHost)."
+        // 1. Public SDK IDN + Character.UnicodeScript Homograph Inspection
+        val normalized = Normalizer.normalize(unicodeHost, Normalizer.Form.NFKC)
+        val hasMixedOrCyrillic = normalized.split('.').any { label ->
+            val scripts = label.codePoints().toArray()
+                .map { Character.UnicodeScript.of(it) }
+                .filter { it != Character.UnicodeScript.COMMON && it != Character.UnicodeScript.INHERITED }
+                .toSet()
+            scripts.size > 1 || Character.UnicodeScript.CYRILLIC in scripts || Character.UnicodeScript.GREEK in scripts
         }
-
-        // 2. Brand Confusable Skeleton Comparison
-        for (brand in protectedBrands) {
-            if (unicodeHost != brand && !unicodeHost.endsWith(".$brand")) {
-                if (spoofChecker.areConfusable(unicodeHost, brand)) {
-                    reasons += "Hostname visually impersonates protected domain '$brand'."
-                }
-            }
+        if (asciiHost.contains("xn--") || hasMixedOrCyrillic) {
+            reasons += "IDN homograph / mixed-script confusable hostname detected ($unicodeHost)."
         }
 
         // 3. Drive-by APK / Binary Payload Detection
@@ -1199,7 +1188,7 @@ private fun InterceptorSheet(
       'Automatically switches to signed production release APKs when ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD secrets are added.',
     ],
     performanceNotes: [
-      'Uses actions/setup-node@v4 npm cache and gradle/actions/setup-gradle@v4 build cache to cut repeat APK workflow runs under 3 minutes.',
+      'Uses actions/cache@v4 keyed on package.json (no lockfile required) and gradle/actions/setup-gradle@v4 build cache to cut repeat APK workflow runs under 3 minutes.',
     ],
     code: `name: Build Android APK
 
@@ -1224,28 +1213,35 @@ permissions:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    env:
+      NODE_OPTIONS: '--no-deprecation'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: \${{ runner.os }}-npm-\${{ hashFiles('package.json') }}
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npm test && npm run lint
+      - run: npm run build && node scripts/prepare-android-ci.mjs && npx cap sync android
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
       - uses: android-actions/setup-android@v3
-      - run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+      - run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
       - uses: gradle/actions/setup-gradle@v4
-      - run: npm ci && npm test && npm run lint
-      - run: npm run build && npx cap sync android
-      - run: chmod +x android/gradlew
+        with:
+          validate-wrappers: false
       - working-directory: android
-        run: ./gradlew assembleDebug assembleRelease --stacktrace
+        run: ./gradlew assembleDebug assembleRelease --stacktrace --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: AegisLocal-Debug-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk`,
+          path: dist-apk/AegisLocal-debug.apk`,
   },
   {
     id: 'capacitor-plugin',

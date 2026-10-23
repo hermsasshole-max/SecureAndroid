@@ -8,7 +8,7 @@
     "build": "vite build",
     "start": "node server.ts",
     "preview": "vite preview",
-    "cap:sync": "vite build && npx cap sync android",
+    "cap:sync": "vite build && node scripts/prepare-android-ci.mjs && npx cap sync android",
     "android:debug": "npm run cap:sync && ./android/gradlew -p android assembleDebug",
     "test": "npx --yes tsx --test src/security/security.test.ts",
     "clean": "rm -rf dist server.js",
@@ -35,7 +35,7 @@
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"

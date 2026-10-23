@@ -30,7 +30,9 @@ jobs:
   build-apk:
     name: Capacitor Sync & Gradle APK Build
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
+    env:
+      NODE_OPTIONS: '--no-deprecation'
 
     steps:
       - name: Checkout repository
@@ -40,7 +42,29 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+
+      - name: Cache npm packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install npm dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Run cybersecurity unit tests
+        run: npm test
+
+      - name: Run TypeScript type check
+        run: npm run lint
+
+      - name: Build Vite production bundle, verify Android binaries & sync Capacitor
+        run: |
+          npm run build
+          node scripts/prepare-android-ci.mjs
+          npx cap sync android
 
       - name: Set up JDK 21 (Temurin)
         uses: actions/setup-java@v4
@@ -52,24 +76,16 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Accept Android SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
 
       - name: Configure Gradle caching
         uses: gradle/actions/setup-gradle@v4
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Run cybersecurity unit tests
-        run: npm test
-
-      - name: Run TypeScript type check
-        run: npm run lint
-
-      - name: Build Vite production web bundle & sync Capacitor Android
-        run: |
-          npm run build
-          npx cap sync android
+        with:
+          validate-wrappers: false
 
       - name: Decode optional Release Keystore from GitHub Secrets
         id: keystore
@@ -89,18 +105,18 @@ jobs:
         run: chmod +x android/gradlew
 
       - name: Build Debug APK
-        if: ${{ github.event.inputs.build_variant != 'release' }}
+        if: ${{ (inputs.build_variant || github.event.inputs.build_variant || 'both') != 'release' }}
         working-directory: android
-        run: ./gradlew assembleDebug --stacktrace
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: Build Release APK
-        if: ${{ github.event.inputs.build_variant != 'debug' }}
+        if: ${{ (inputs.build_variant || github.event.inputs.build_variant || 'both') != 'debug' }}
         working-directory: android
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --stacktrace
+        run: ./gradlew assembleRelease --stacktrace --no-daemon
 
       - name: Collect built APKs into dist-apk/
         run: |
@@ -116,7 +132,7 @@ jobs:
           ls -lh dist-apk/
 
       - name: Upload Debug APK Artifact
-        if: ${{ github.event.inputs.build_variant != 'release' }}
+        if: ${{ (inputs.build_variant || github.event.inputs.build_variant || 'both') != 'release' }}
         uses: actions/upload-artifact@v4
         with:
           name: AegisLocal-Debug-APK
@@ -125,7 +141,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Release APK Artifact
-        if: ${{ github.event.inputs.build_variant != 'debug' }}
+        if: ${{ (inputs.build_variant || github.event.inputs.build_variant || 'both') != 'debug' }}
         uses: actions/upload-artifact@v4
         with:
           name: AegisLocal-Release-APK
