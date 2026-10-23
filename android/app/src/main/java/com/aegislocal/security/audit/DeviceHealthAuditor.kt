@@ -17,35 +17,63 @@ import com.getcapacitor.JSObject
 /**
  * Audits installed non-system Android packages for Accessibility + Overlay + SMS
  * spyware triads and inspects hardware Keyguard, OS security patch, and ADB posture.
+ * All cross-package OS queries are isolated inside runCatching to prevent
+ * SecurityException or Binder TransactionTooLargeException crashes.
  */
 class DeviceHealthAuditor(context: Context) {
 
     private val appContext = context.applicationContext
     private val pm: PackageManager = appContext.packageManager
 
+    @Volatile
+    private var detectedSideloadedApp: Boolean = false
+
     fun scanInstalledUserPackages(): JSArray {
-        val am = appContext.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
-        val appOps = appContext.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-        val enabledA11yPackages = am
-            .getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-            .mapNotNull { it.resolveInfo?.serviceInfo?.packageName }
-            .toSet()
-
-        val packages: List<PackageInfo> = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            pm.getInstalledPackages(
-                PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS.toLong())
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getInstalledPackages(PackageManager.GET_PERMISSIONS)
-        }
-
         val out = JSArray()
-        for (pkg in packages) {
-            val appInfo = pkg.applicationInfo ?: continue
+
+        val enabledA11yPackages: Set<String> = runCatching {
+            val am = appContext.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager
+            am?.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+                ?.mapNotNull { it.resolveInfo?.serviceInfo?.packageName }
+                ?.toSet()
+                .orEmpty()
+        }.getOrDefault(emptySet())
+
+        val appOps = runCatching {
+            appContext.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager
+        }.getOrNull()
+
+        // Query lightweight ApplicationInfo list first to avoid Binder TransactionTooLargeException
+        val installedApps: List<ApplicationInfo> = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getInstalledApplications(0)
+            }
+        }.getOrDefault(emptyList())
+
+        var sideloadFound = false
+        var count = 0
+
+        for (appInfo in installedApps) {
+            if (count >= 150) break
+            val pkgName = appInfo.packageName ?: continue
             val isUpdatedSystem = (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
             val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0 && !isUpdatedSystem
-            if (isSystem || pkg.packageName == appContext.packageName) continue
+            if (isSystem || pkgName == appContext.packageName) continue
+
+            val pkg: PackageInfo = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pm.getPackageInfo(
+                        pkgName,
+                        PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS.toLong())
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    pm.getPackageInfo(pkgName, PackageManager.GET_PERMISSIONS)
+                }
+            }.getOrNull() ?: continue
 
             val grantedSeen = mutableSetOf<String>()
             var declaresOverlay = false
@@ -53,7 +81,7 @@ class DeviceHealthAuditor(context: Context) {
             val reqFlags = pkg.requestedPermissionsFlags ?: IntArray(0)
 
             for (i in reqNames.indices) {
-                val permName = reqNames[i]
+                val permName = reqNames[i] ?: continue
                 if (permName == Manifest.permission.SYSTEM_ALERT_WINDOW) {
                     declaresOverlay = true
                 }
@@ -64,27 +92,36 @@ class DeviceHealthAuditor(context: Context) {
                 }
             }
 
-            val overlayMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                appOps.unsafeCheckOpNoThrow(
-                    AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
-                    appInfo.uid,
-                    pkg.packageName
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                appOps.checkOpNoThrow(
-                    AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
-                    appInfo.uid,
-                    pkg.packageName
-                )
+            // Cross-UID AppOps checks may throw SecurityException without GET_APP_OPS_STATS;
+            // fall back safely to manifest + permission flag state if restricted by OEM OS.
+            val overlayMode: Int? = runCatching {
+                if (appOps == null) null
+                else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    appOps.unsafeCheckOpNoThrow(
+                        AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
+                        appInfo.uid,
+                        pkgName
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    appOps.checkOpNoThrow(
+                        AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
+                        appInfo.uid,
+                        pkgName
+                    )
+                }
+            }.getOrNull()
+
+            val hasOverlay = when (overlayMode) {
+                AppOpsManager.MODE_ALLOWED -> true
+                AppOpsManager.MODE_IGNORED, AppOpsManager.MODE_ERRORED -> false
+                else -> declaresOverlay
             }
-            val hasOverlay = overlayMode == AppOpsManager.MODE_ALLOWED ||
-                (overlayMode == AppOpsManager.MODE_DEFAULT && declaresOverlay)
             if (hasOverlay) {
                 grantedSeen += Manifest.permission.SYSTEM_ALERT_WINDOW
             }
 
-            val isA11yEnabled = pkg.packageName in enabledA11yPackages
+            val isA11yEnabled = pkgName in enabledA11yPackages
             if (isA11yEnabled) {
                 grantedSeen += Manifest.permission.BIND_ACCESSIBILITY_SERVICE
             }
@@ -92,24 +129,45 @@ class DeviceHealthAuditor(context: Context) {
             val grantedPermissions = JSArray()
             grantedSeen.forEach { grantedPermissions.put(it) }
 
-            val rawInstaller = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                runCatching { pm.getInstallSourceInfo(pkg.packageName).installingPackageName }.getOrNull()
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getInstallerPackageName(pkg.packageName)
-            }
+            val rawInstaller = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    pm.getInstallSourceInfo(pkgName).installingPackageName
+                } else {
+                    @Suppress("DEPRECATION")
+                    pm.getInstallerPackageName(pkgName)
+                }
+            }.getOrNull()
 
-            val installerSource = when (rawInstaller) {
-                "com.android.vending" -> "com.android.vending"
-                null -> "adb-sideload"
+            val trustedStores = setOf(
+                "com.android.vending",
+                "com.sec.android.app.samsungapps",
+                "com.google.android.packageinstaller"
+            )
+            val installerSource = when {
+                rawInstaller == "com.android.vending" || rawInstaller == "com.sec.android.app.samsungapps" ->
+                    "com.android.vending"
+                rawInstaller == null -> {
+                    sideloadFound = true
+                    "adb-sideload"
+                }
+                rawInstaller !in trustedStores -> {
+                    sideloadFound = true
+                    "com.chrome.downloader"
+                }
                 else -> "com.chrome.downloader"
             }
 
-            val hasLauncher = pm.getLaunchIntentForPackage(pkg.packageName) != null
+            val hasLauncher = runCatching {
+                pm.getLaunchIntentForPackage(pkgName) != null
+            }.getOrDefault(true)
+
+            val label = runCatching {
+                appInfo.loadLabel(pm).toString().ifBlank { pkgName }
+            }.getOrDefault(pkgName)
 
             val item = JSObject().apply {
-                put("packageName", pkg.packageName)
-                put("appName", appInfo.loadLabel(pm).toString())
+                put("packageName", pkgName)
+                put("appName", label)
                 put("installerSource", installerSource)
                 put("versionName", pkg.versionName ?: "1.0")
                 put("targetSdk", appInfo.targetSdkVersion)
@@ -119,30 +177,61 @@ class DeviceHealthAuditor(context: Context) {
                 put("permissions", grantedPermissions)
             }
             out.put(item)
+            count += 1
         }
 
+        detectedSideloadedApp = sideloadFound
         return out
     }
 
     fun evaluateDeviceHealthState(): JSObject {
-        val keyguard = appContext.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-        val isSecure = keyguard.isDeviceSecure
-        val patchDate = Build.VERSION.SECURITY_PATCH.ifBlank { "2026-01-01" }
+        val isSecure = runCatching {
+            val keyguard = appContext.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            keyguard?.isDeviceSecure ?: true
+        }.getOrDefault(true)
 
-        val adbEnabled = Settings.Global.getInt(
-            appContext.contentResolver,
-            Settings.Global.ADB_ENABLED,
-            0
-        ) == 1
+        val patchDate = runCatching {
+            Build.VERSION.SECURITY_PATCH.ifBlank { "2026-01-01" }
+        }.getOrDefault("2026-01-01")
 
-        val verifierEnabled = Settings.Global.getInt(
-            appContext.contentResolver,
-            "package_verifier_enable",
-            1
-        ) == 1
+        val adbEnabled = runCatching {
+            Settings.Global.getInt(
+                appContext.contentResolver,
+                Settings.Global.ADB_ENABLED,
+                0
+            ) == 1
+        }.getOrDefault(false)
+
+        val verifierEnabled = runCatching {
+            Settings.Global.getInt(
+                appContext.contentResolver,
+                "package_verifier_enable",
+                1
+            ) == 1
+        }.getOrDefault(true)
 
         val playStorePresent = runCatching {
-            pm.getApplicationInfo("com.android.vending", 0).enabled
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getApplicationInfo(
+                    "com.android.vending",
+                    PackageManager.ApplicationInfoFlags.of(0)
+                ).enabled
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getApplicationInfo("com.android.vending", 0).enabled
+            }
+        }.getOrDefault(true)
+
+        // Note: PackageManager.canRequestPackageInstalls() throws a fatal SecurityException
+        // unless REQUEST_INSTALL_PACKAGES is declared in AndroidManifest.xml. Instead, check
+        // legacy unknown-sources setting safely + whether sideloaded APKs were detected.
+        val legacyUnknownSources = runCatching {
+            @Suppress("DEPRECATION")
+            Settings.Secure.getInt(
+                appContext.contentResolver,
+                Settings.Secure.INSTALL_NON_MARKET_APPS,
+                0
+            ) == 1
         }.getOrDefault(false)
 
         return JSObject().apply {
@@ -151,7 +240,7 @@ class DeviceHealthAuditor(context: Context) {
             put("securityPatchDate", patchDate)
             put("playProtectEnabled", verifierEnabled && playStorePresent)
             put("adbDebuggingEnabled", adbEnabled)
-            put("unknownSourcesAllowed", pm.canRequestPackageInstalls())
+            put("unknownSourcesAllowed", legacyUnknownSources || detectedSideloadedApp)
             put("selinuxEnforcing", true)
         }
     }

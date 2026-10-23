@@ -8,7 +8,9 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -29,7 +31,10 @@ import java.nio.ByteBuffer
  */
 class LocalLoopbackVpnService : VpnService() {
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val vpnErrorHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e("LocalLoopbackVpn", "Caught tunnel coroutine error", throwable)
+    }
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + vpnErrorHandler)
     private var tunInterface: ParcelFileDescriptor? = null
 
     companion object {
@@ -48,13 +53,19 @@ class LocalLoopbackVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopLocalTunnel()
-            stopForeground(STOP_FOREGROUND_REMOVE)
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             stopSelf()
             return START_NOT_STICKY
         }
 
-        promoteToForeground()
-        startLocalDnsLoopbackTunnel()
+        runCatching {
+            promoteToForeground()
+            startLocalDnsLoopbackTunnel()
+        }.onFailure { err ->
+            Log.e("LocalLoopbackVpn", "Failed to start local tunnel", err)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
@@ -77,11 +88,15 @@ class LocalLoopbackVpnService : VpnService() {
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
+            try {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } catch (_: Throwable) {
+                startForeground(NOTIFICATION_ID, notification)
+            }
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
@@ -103,7 +118,7 @@ class LocalLoopbackVpnService : VpnService() {
 
         runCatching { builder.addDisallowedApplication(packageName) }
 
-        val established = builder.establish() ?: return
+        val established = runCatching { builder.establish() }.getOrNull() ?: return
         tunInterface = established
         isTunnelRunning = true
         val descriptor = established.fileDescriptor

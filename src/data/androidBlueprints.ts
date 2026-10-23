@@ -913,7 +913,8 @@ class UrlThreatAnalyzer {
       'Audits installed APKs for stalkerware/banking-trojan permission triads and inspects Keyguard, OS security patch age, ADB state, and Play Protect.',
     edgeCases: [
       'AccessibilityManager.getEnabledAccessibilityServiceList() reveals which packages actually have LIVE accessibility control—far higher signal than manifest declaration alone.',
-      'AppOpsManager.checkOpNoThrow(OPSTR_SYSTEM_ALERT_WINDOW) accurately distinguishes granted screen-overlay privileges from ungranted manifest entries.',
+      'Never call PackageManager.canRequestPackageInstalls() without declaring REQUEST_INSTALL_PACKAGES in AndroidManifest.xml (which triggers fatal SecurityException on Android 8+); inspect InstallSourceInfo per package instead.',
+      'Wrap cross-UID AppOpsManager.unsafeCheckOpNoThrow(OPSTR_SYSTEM_ALERT_WINDOW) in runCatching so OEM ROMs restricting GET_APP_OPS_STATS fall back cleanly.',
     ],
     performanceNotes: [
       'Batch PackageManager.getInstalledPackages(GET_PERMISSIONS) on Dispatchers.Default and cache results until ACTION_PACKAGE_ADDED / REMOVED broadcasts fire.',

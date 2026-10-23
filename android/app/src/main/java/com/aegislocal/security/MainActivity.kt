@@ -9,8 +9,8 @@ class MainActivity : BridgeActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         registerPlugin(AegisSecurityPlugin::class.java)
-        captureExternalLinkIntent(intent)
         super.onCreate(savedInstanceState)
+        captureExternalLinkIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -19,13 +19,16 @@ class MainActivity : BridgeActivity() {
     }
 
     private fun captureExternalLinkIntent(incoming: Intent?) {
-        if (incoming?.action == Intent.ACTION_VIEW) {
-            val url = incoming.dataString?.take(8192)
-            if (!url.isNullOrBlank() && (url.startsWith("http://") || url.startsWith("https://"))) {
-                AegisSecurityPlugin.recordInterceptedIntent(
-                    url = url,
-                    caller = referrer?.host ?: "External App"
-                )
+        runCatching {
+            if (incoming?.action == Intent.ACTION_VIEW) {
+                val url = incoming.dataString?.take(8192)
+                if (!url.isNullOrBlank() && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    val callerHost = runCatching { referrer?.host }.getOrNull() ?: "External App"
+                    AegisSecurityPlugin.recordInterceptedIntent(
+                        url = url,
+                        caller = callerHost
+                    )
+                }
             }
         }
     }

@@ -6,7 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
 import java.net.IDN
-import java.net.URI
+import java.net.URL
 import java.text.Normalizer
 
 /**
@@ -15,6 +15,7 @@ import java.text.Normalizer
  */
 class UrlThreatAnalyzer {
 
+    @Suppress("DEPRECATION")
     suspend fun expandRedirectChain(rawUrl: String, maxHops: Int = 6): JSObject =
         withContext(Dispatchers.IO) {
             val hopsArray = JSArray()
@@ -23,7 +24,7 @@ class UrlThreatAnalyzer {
             for (step in 1..(maxHops + 1)) {
                 val startMs = System.currentTimeMillis()
                 val connection = runCatching {
-                    (URI.create(currentUrl).toURL().openConnection() as HttpURLConnection).apply {
+                    (URL(currentUrl).openConnection() as HttpURLConnection).apply {
                         requestMethod = "HEAD"
                         instanceFollowRedirects = false
                         connectTimeout = 3500
@@ -52,7 +53,9 @@ class UrlThreatAnalyzer {
                     hopsArray.put(hopObj)
 
                     if (statusCode in 300..399 && !location.isNullOrBlank()) {
-                        val nextResolved = URI.create(currentUrl).resolve(location).toString()
+                        val nextResolved = runCatching {
+                            URL(URL(currentUrl), location).toString()
+                        }.getOrNull() ?: break
                         if (!nextResolved.startsWith("http://") && !nextResolved.startsWith("https://")) {
                             break
                         }
@@ -60,16 +63,18 @@ class UrlThreatAnalyzer {
                     } else {
                         break
                     }
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                     break
                 } finally {
-                    connection.disconnect()
+                    runCatching { connection.disconnect() }
                 }
             }
 
-            val host = runCatching { URI.create(currentUrl).host.orEmpty().lowercase() }.getOrDefault("")
+            val host = runCatching { URL(currentUrl).host.orEmpty().lowercase() }.getOrDefault("")
             val unicodeHost = runCatching { IDN.toUnicode(host, IDN.ALLOW_UNASSIGNED) }.getOrDefault(host)
-            val homographFlagged = host.isNotEmpty() && hasDeceptiveUnicodeScript(host, unicodeHost)
+            val homographFlagged = runCatching {
+                host.isNotEmpty() && hasDeceptiveUnicodeScript(host, unicodeHost)
+            }.getOrDefault(false)
 
             JSObject().apply {
                 put("mode", "android-native-head")
@@ -80,10 +85,6 @@ class UrlThreatAnalyzer {
             }
         }
 
-    /**
-     * Uses public java.lang.Character.UnicodeScript + Normalizer (API 24+) to flag
-     * mixed-script Latin/Cyrillic/Greek labels and Punycode confusables without hidden APIs.
-     */
     private fun hasDeceptiveUnicodeScript(asciiHost: String, unicodeHost: String): Boolean {
         if (asciiHost.contains("xn--")) return true
         val normalized = Normalizer.normalize(unicodeHost, Normalizer.Form.NFKC)

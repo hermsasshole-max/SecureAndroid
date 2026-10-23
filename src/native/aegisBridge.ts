@@ -30,7 +30,7 @@ export interface NativePendingIntentResponse {
 }
 
 export interface AegisSecurityPluginContract {
-  scanWifiNetworks(): Promise<NativeWifiScanResponse>;
+  scanWifiNetworks(options?: { forcePrompt?: boolean }): Promise<NativeWifiScanResponse>;
   toggleLocalVpn(options: { enable: boolean }): Promise<NativeVpnStatusResponse>;
   expandUrlNative(options: { url: string }): Promise<NativeUrlExpansionResponse>;
   openVerifiedExternalBrowser(options: { url: string }): Promise<{ launched: boolean }>;

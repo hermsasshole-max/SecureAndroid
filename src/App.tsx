@@ -48,7 +48,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>(getInitialTabFromQuery);
   const [accessPoints, setAccessPoints] = useState<WifiAccessPoint[]>(INITIAL_WIFI_SCAN);
   const [baselines, setBaselines] = useState<BssidBaseline[]>(INITIAL_BSSID_BASELINES);
-  const [vpnLoopbackActive, setVpnLoopbackActive] = useState<boolean>(true);
+  const [vpnLoopbackActive, setVpnLoopbackActive] = useState<boolean>(
+    () => !isRunningOnAndroidNative()
+  );
   const [recentUrlAnalyses, setRecentUrlAnalyses] = useState<UrlAnalysisResult[]>([]);
   const [packages, setPackages] = useState<InstalledAppPackage[]>(INITIAL_INSTALLED_PACKAGES);
   const [deviceHealth, setDeviceHealth] = useState<DeviceHealthState>(INITIAL_DEVICE_HEALTH);
@@ -70,8 +72,8 @@ export default function App() {
       try {
         if (isRunningOnAndroidNative()) {
           // 1. Check if launched via Android Browser Picker ACTION_VIEW intent
-          const pending = await AegisSecurityNative.consumePendingInterceptUrl();
-          if (!cancelled && pending.interceptedUrl) {
+          const pending = await AegisSecurityNative.consumePendingInterceptUrl().catch(() => null);
+          if (!cancelled && pending?.interceptedUrl) {
             setInterceptedIntent({
               url: pending.interceptedUrl,
               caller: pending.callerPackage ?? 'Android Intent',
@@ -82,31 +84,42 @@ export default function App() {
           // 2. Load hardware-backed EncryptedSharedPreferences baselines
           const encBaselines = await AegisSecurityNative.getEncryptedString({
             key: 'wifi_bssid_baselines_v1',
-          });
+          }).catch(() => ({ value: null }));
           if (!cancelled && encBaselines.value) {
-            setBaselines(JSON.parse(encBaselines.value) as BssidBaseline[]);
+            try {
+              setBaselines(JSON.parse(encBaselines.value) as BssidBaseline[]);
+            } catch {
+              // Ignore malformed stored JSON
+            }
           }
 
-          // 3. Scan real device Wi-Fi ScanResults, Installed Packages, and OS Posture
-          const [wifiRes, pkgRes, healthRes] = await Promise.all([
-            AegisSecurityNative.scanWifiNetworks(),
-            AegisSecurityNative.scanInstalledPackages(),
-            AegisSecurityNative.getDeviceHealthState(),
+          // 3. Scan device posture & installed packages first, then request/run Wi-Fi scan
+          const [pkgRes, healthRes] = await Promise.all([
+            AegisSecurityNative.scanInstalledPackages().catch(() => ({ packages: [] })),
+            AegisSecurityNative.getDeviceHealthState().catch(() => null),
           ]);
 
           if (!cancelled) {
-            if (wifiRes.permissionGranted && wifiRes.accessPoints.length > 0) {
-              setAccessPoints(
-                wifiRes.accessPoints.map((ap) => ({
-                  ...ap,
-                  protocol: mapSecurityStringToEnum(String(ap.protocol)),
-                }))
-              );
-            }
             if (pkgRes.packages.length > 0) {
               setPackages(pkgRes.packages);
             }
-            setDeviceHealth(healthRes);
+            if (healthRes) {
+              setDeviceHealth(healthRes);
+            }
+          }
+
+          const wifiRes = await AegisSecurityNative.scanWifiNetworks().catch(() => ({
+            permissionGranted: false,
+            accessPoints: [],
+          }));
+
+          if (!cancelled && wifiRes.permissionGranted && wifiRes.accessPoints.length > 0) {
+            setAccessPoints(
+              wifiRes.accessPoints.map((ap) => ({
+                ...ap,
+                protocol: mapSecurityStringToEnum(String(ap.protocol)),
+              }))
+            );
           }
         }
 
@@ -183,7 +196,7 @@ export default function App() {
       await AegisSecurityNative.putEncryptedString({
         key: 'wifi_bssid_baselines_v1',
         value: JSON.stringify(nextBaselines),
-      });
+      }).catch(() => null);
     }
     await vault.putEncrypted('wifi_bssid_baselines_v1', nextBaselines);
     setEncryptedEntries(vault.inspectEncryptedEntries());
@@ -208,9 +221,32 @@ export default function App() {
   };
 
   const handleResetScan = async () => {
-    setAccessPoints(INITIAL_WIFI_SCAN);
+    if (isRunningOnAndroidNative()) {
+      const wifiRes = await AegisSecurityNative.scanWifiNetworks({ forcePrompt: true }).catch(
+        () => ({
+          permissionGranted: false,
+          accessPoints: [],
+        })
+      );
+      if (wifiRes.permissionGranted && wifiRes.accessPoints.length > 0) {
+        setAccessPoints(
+          wifiRes.accessPoints.map((ap) => ({
+            ...ap,
+            protocol: mapSecurityStringToEnum(String(ap.protocol)),
+          }))
+        );
+      } else {
+        setAccessPoints(INITIAL_WIFI_SCAN);
+      }
+      await AegisSecurityNative.putEncryptedString({
+        key: 'wifi_bssid_baselines_v1',
+        value: JSON.stringify(INITIAL_BSSID_BASELINES),
+      }).catch(() => null);
+    } else {
+      setAccessPoints(INITIAL_WIFI_SCAN);
+      setVpnLoopbackActive(true);
+    }
     setBaselines(INITIAL_BSSID_BASELINES);
-    setVpnLoopbackActive(true);
     await vault.putEncrypted('wifi_bssid_baselines_v1', INITIAL_BSSID_BASELINES);
     setEncryptedEntries(vault.inspectEncryptedEntries());
   };

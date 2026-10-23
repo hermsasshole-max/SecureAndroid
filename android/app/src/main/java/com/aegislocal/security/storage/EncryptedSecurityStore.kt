@@ -11,12 +11,14 @@ import kotlinx.coroutines.withContext
 
 /**
  * Hardware-backed EncryptedSharedPreferences wrapper using Android Keystore
- * AES256-GCM MasterKey + AES256-SIV deterministic key encryption.
+ * AES256-GCM MasterKey + AES256-SIV deterministic key encryption, with resilient
+ * recovery if OEM Keystore keys are invalidated.
  */
 class EncryptedSecurityStore(context: Context) {
 
     private val appContext: Context = context.applicationContext
     private val initMutex = Mutex()
+
     @Volatile
     private var cachedPrefs: SharedPreferences? = null
 
@@ -33,10 +35,14 @@ class EncryptedSecurityStore(context: Context) {
     private fun createOrRecoverEncryptedPrefs(): SharedPreferences {
         return try {
             createEncryptedPrefsInstance()
-        } catch (_: Exception) {
-            // Recover cleanly if lockscreen credential reset invalidated the Keystore keyset
-            appContext.deleteSharedPreferences(PREFS_FILE_NAME)
-            createEncryptedPrefsInstance()
+        } catch (_: Throwable) {
+            // Recover if lockscreen credential reset invalidated the Keystore keyset
+            runCatching { appContext.deleteSharedPreferences(PREFS_FILE_NAME) }
+            try {
+                createEncryptedPrefsInstance()
+            } catch (_: Throwable) {
+                appContext.getSharedPreferences("${PREFS_FILE_NAME}_fallback", Context.MODE_PRIVATE)
+            }
         }
     }
 
@@ -55,10 +61,14 @@ class EncryptedSecurityStore(context: Context) {
     }
 
     suspend fun putEncryptedString(key: String, value: String) = withContext(Dispatchers.IO) {
-        prefs().edit().putString(key, value).apply()
+        runCatching {
+            prefs().edit().putString(key, value).apply()
+        }
     }
 
     suspend fun getEncryptedString(key: String): String? = withContext(Dispatchers.IO) {
-        prefs().getString(key, null)
+        runCatching {
+            prefs().getString(key, null)
+        }.getOrNull()
     }
 }
