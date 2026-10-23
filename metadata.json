@@ -1,0 +1,6 @@
+{
+  "name": "AegisLocal — Android Cybersecurity Workbench",
+  "description": "Privacy-first local Android security architecture and interactive analyzer for rogue Wi-Fi Evil Twin detection, URL homograph and redirect inspection, app permission auditing, and Kotlin VpnService blueprints.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,13 @@
+node_modules/
+/build/
+/dist/
+/server.js
+coverage/
+.playwright-cli/
+.DS_Store
+*.log
+*.jks
+*.keystore
+.env*
+!.env.example
+
