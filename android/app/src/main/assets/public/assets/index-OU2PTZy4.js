@@ -1271,8 +1271,14 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
-      - uses: android-actions/setup-android@v3
-      - run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
+      - name: Configure Android SDK & Accept Licenses
+        shell: bash
+        run: |
+          set +o pipefail
+          SDK_ROOT="\${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          printf "sdk.dir=%s\\n" "$SDK_ROOT" > android/local.properties
+          yes 2>/dev/null | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          yes 2>/dev/null | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-36" "build-tools;35.0.0" >/dev/null
       - uses: gradle/actions/setup-gradle@v4
         with:
           validate-wrappers: false

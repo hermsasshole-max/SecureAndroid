@@ -45,13 +45,17 @@ android {
             def keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
             if (keystorePath != null && !keystorePath.isEmpty() && file(keystorePath).exists()) {
                 signingConfig signingConfigs.release
+            } else {
+                signingConfig signingConfigs.debug
             }
         }
     }
 }
 
 kotlin {
-    jvmToolchain(21)
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21
+    }
 }
 
 repositories {
