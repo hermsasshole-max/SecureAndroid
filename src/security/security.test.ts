@@ -216,3 +216,108 @@ test('Capacitor Android bridge maps ScanResult security capabilities to Encrypti
   assert.equal(mapSecurityStringToEnum('ESS'), EncryptionProtocol.OPEN);
 });
 
+test('Live Shield Shannon entropy and domain normalization validate inputs accurately', async () => {
+  const { calculateShannonEntropy, normalizeDomainInput } = await import('./liveShield');
+  assert.equal(calculateShannonEntropy('aaaaaa'), 0);
+  assert.ok(calculateShannonEntropy('x9f8a7k2m4n1q0p8r3t6v5w2') >= 4.0);
+
+  assert.equal(normalizeDomainInput('  HTTPS://Api.GitHub.com:443/repos '), 'api.github.com');
+  assert.equal(normalizeDomainInput(''), null);
+  assert.equal(normalizeDomainInput('invalid_host_without_tld'), null);
+  assert.equal(normalizeDomainInput('-badlabel.com'), null);
+});
+
+test('Live Shield DNS sinkhole blocks DGA beacons, RAT DDNS, Punycode homographs, and custom blocklist', async () => {
+  const { DEFAULT_LIVE_SHIELD_POLICY, evaluateDnsDomainThreat } = await import('./liveShield');
+
+  const clean = evaluateDnsDomainThreat('developer.android.com', DEFAULT_LIVE_SHIELD_POLICY, []);
+  assert.equal(clean.blocked, false);
+  assert.equal(clean.severity, ThreatSeverity.NOMINAL);
+  assert.equal(clean.matchedRule, 'CLEAN_PASS');
+
+  const customBlocked = evaluateDnsDomainThreat(
+    'telemetry.stalker-tracker.net',
+    DEFAULT_LIVE_SHIELD_POLICY,
+    ['stalker-tracker.net']
+  );
+  assert.equal(customBlocked.blocked, true);
+  assert.equal(customBlocked.severity, ThreatSeverity.CRITICAL);
+  assert.equal(customBlocked.matchedRule, 'CUSTOM_SINKHOLE_BLOCKLIST');
+
+  const ratDdns = evaluateDnsDomainThreat(
+    'spynote-panel-09.duckdns.org',
+    DEFAULT_LIVE_SHIELD_POLICY,
+    []
+  );
+  assert.equal(ratDdns.blocked, true);
+  assert.equal(ratDdns.severity, ThreatSeverity.CRITICAL);
+  assert.equal(ratDdns.matchedRule, 'RAT_DYNAMIC_DNS_C2');
+
+  const dgaBeacon = evaluateDnsDomainThreat(
+    'q8w9e2r7t4y1u6i3o0p5a9s8.org',
+    DEFAULT_LIVE_SHIELD_POLICY,
+    []
+  );
+  assert.equal(dgaBeacon.blocked, true);
+  assert.equal(dgaBeacon.severity, ThreatSeverity.CRITICAL);
+  assert.equal(dgaBeacon.matchedRule, 'DGA_HIGH_ENTROPY_BEACON');
+
+  const homograph = evaluateDnsDomainThreat(
+    'xn--pypal-4ve.com',
+    DEFAULT_LIVE_SHIELD_POLICY,
+    []
+  );
+  assert.equal(homograph.blocked, true);
+  assert.equal(homograph.severity, ThreatSeverity.CRITICAL);
+  assert.equal(homograph.matchedRule, 'IDN_HOMOGRAPH_OR_SPOOF');
+});
+
+test('Live Shield RASP integrity sweep flags rogue Root CAs, Frida hooks, and Wireless ADB', async () => {
+  const { evaluateIntegritySweep } = await import('./liveShield');
+
+  const compromisedChecks = evaluateIntegritySweep({
+    platform: 'android-native',
+    shieldArmed: true,
+    vpnTunnelActive: true,
+    overlayShieldActive: true,
+    secureTransportTls: true,
+    malwareDnsReachable: true,
+    malwareDnsLatencyMs: 18,
+    userRootCaCount: 1,
+    userRootCaSubjects: ['CN=MitmProxy Root CA'],
+    fridaOrXposedDetected: true,
+    debuggerAttached: false,
+    rootIndicatorsFound: false,
+    usbAdbEnabled: false,
+    wirelessAdbEnabled: true,
+    httpProxyHost: null,
+    enabledAccessibilityPackages: ['com.stalker.keylogger'],
+    domInjectionCount: 0,
+    inspectedDnsQueries: 42,
+    blockedDnsQueries: 3,
+    lastSweepIso: '2026-10-23T18:00:00Z',
+  });
+
+  const byId = Object.fromEntries(compromisedChecks.map((c) => [c.id, c]));
+  assert.equal(byId['dns-sinkhole'].status, ThreatSeverity.NOMINAL);
+  assert.equal(byId['ca-store'].status, ThreatSeverity.CRITICAL);
+  assert.equal(byId['rasp-hooks'].status, ThreatSeverity.CRITICAL);
+  assert.equal(byId['proxy-adb'].status, ThreatSeverity.CRITICAL);
+  assert.equal(byId['overlay-a11y'].status, ThreatSeverity.WARNING);
+});
+
+test('EncryptedPreferencesVault removeEntry and removeKeys purge records cleanly', async () => {
+  const mem = new MemoryStorageAdapter();
+  const vault = new EncryptedPreferencesVault(mem);
+  await vault.putEncrypted('legacy_demo_v1', { demo: true });
+  await vault.putEncrypted('keep_v2', { live: true });
+
+  vault.removeKeys(['legacy_demo_v1']);
+  assert.equal(await vault.getDecrypted('legacy_demo_v1'), null);
+  assert.deepEqual(await vault.getDecrypted('keep_v2'), { live: true });
+
+  vault.removeEntry('keep_v2');
+  assert.equal(vault.inspectEncryptedEntries().length, 0);
+});
+
+

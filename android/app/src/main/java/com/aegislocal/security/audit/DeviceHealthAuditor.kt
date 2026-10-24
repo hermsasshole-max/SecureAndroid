@@ -187,19 +187,25 @@ class DeviceHealthAuditor(context: Context) {
     fun evaluateDeviceHealthState(): JSObject {
         val isSecure = runCatching {
             val keyguard = appContext.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-            keyguard?.isDeviceSecure ?: true
-        }.getOrDefault(true)
+            keyguard?.isDeviceSecure ?: false
+        }.getOrDefault(false)
 
         val patchDate = runCatching {
-            Build.VERSION.SECURITY_PATCH.ifBlank { "2026-01-01" }
-        }.getOrDefault("2026-01-01")
+            Build.VERSION.SECURITY_PATCH.ifBlank { "Unknown" }
+        }.getOrDefault("Unknown")
 
         val adbEnabled = runCatching {
-            Settings.Global.getInt(
+            val usbAdb = Settings.Global.getInt(
                 appContext.contentResolver,
                 Settings.Global.ADB_ENABLED,
                 0
             ) == 1
+            val wifiAdb = Settings.Global.getInt(
+                appContext.contentResolver,
+                "adb_wifi_enabled",
+                0
+            ) == 1
+            usbAdb || wifiAdb
         }.getOrDefault(false)
 
         val verifierEnabled = runCatching {
@@ -220,11 +226,8 @@ class DeviceHealthAuditor(context: Context) {
                 @Suppress("DEPRECATION")
                 pm.getApplicationInfo("com.android.vending", 0).enabled
             }
-        }.getOrDefault(true)
+        }.getOrDefault(false)
 
-        // Note: PackageManager.canRequestPackageInstalls() throws a fatal SecurityException
-        // unless REQUEST_INSTALL_PACKAGES is declared in AndroidManifest.xml. Instead, check
-        // legacy unknown-sources setting safely + whether sideloaded APKs were detected.
         val legacyUnknownSources = runCatching {
             @Suppress("DEPRECATION")
             Settings.Secure.getInt(
@@ -234,14 +237,19 @@ class DeviceHealthAuditor(context: Context) {
             ) == 1
         }.getOrDefault(false)
 
+        val selinuxEnforcing = runCatching {
+            val f = java.io.File("/sys/fs/selinux/enforce")
+            if (f.canRead()) f.readText().trim() == "1" else true
+        }.getOrDefault(true)
+
         return JSObject().apply {
             put("deviceLockSecure", isSecure)
-            put("lockMethod", if (isSecure) "Biometric + PIN" else "Swipe Only")
+            put("lockMethod", if (isSecure) "Biometric + PIN" else "None")
             put("securityPatchDate", patchDate)
             put("playProtectEnabled", verifierEnabled && playStorePresent)
             put("adbDebuggingEnabled", adbEnabled)
             put("unknownSourcesAllowed", legacyUnknownSources || detectedSideloadedApp)
-            put("selinuxEnforcing", true)
+            put("selinuxEnforcing", selinuxEnforcing)
         }
     }
 }

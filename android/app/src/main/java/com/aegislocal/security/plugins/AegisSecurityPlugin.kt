@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.result.ActivityResult
 import androidx.core.content.ContextCompat
@@ -14,6 +15,7 @@ import com.aegislocal.security.audit.DeviceHealthAuditor
 import com.aegislocal.security.links.UrlThreatAnalyzer
 import com.aegislocal.security.network.LocalLoopbackVpnService
 import com.aegislocal.security.network.WifiThreatInspector
+import com.aegislocal.security.shield.LiveShieldMonitor
 import com.aegislocal.security.storage.EncryptedSecurityStore
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
@@ -41,6 +43,12 @@ import kotlinx.coroutines.launch
                 Manifest.permission.ACCESS_FINE_LOCATION,
                 Manifest.permission.ACCESS_COARSE_LOCATION
             ]
+        ),
+        Permission(
+            alias = "shieldNotifications",
+            strings = [
+                Manifest.permission.POST_NOTIFICATIONS
+            ]
         )
     ]
 )
@@ -56,7 +64,11 @@ class AegisSecurityPlugin : Plugin() {
     private lateinit var encryptedStore: EncryptedSecurityStore
     private lateinit var wifiInspector: WifiThreatInspector
     private lateinit var deviceAuditor: DeviceHealthAuditor
+    private lateinit var liveShieldMonitor: LiveShieldMonitor
     private val urlAnalyzer = UrlThreatAnalyzer()
+
+    @Volatile
+    private var pendingShieldDnsEnable: Boolean = false
 
     companion object {
         private const val TAG = "AegisSecurityPlugin"
@@ -79,6 +91,9 @@ class AegisSecurityPlugin : Plugin() {
             encryptedStore = EncryptedSecurityStore(context)
             wifiInspector = WifiThreatInspector(context)
             deviceAuditor = DeviceHealthAuditor(context)
+            liveShieldMonitor = LiveShieldMonitor(context) { alertEvent ->
+                notifyListeners("shieldAlert", alertEvent, true)
+            }
         }.onFailure { err ->
             Log.e(TAG, "Failed to initialize plugin helpers", err)
         }
@@ -190,16 +205,150 @@ class AegisSecurityPlugin : Plugin() {
     }
 
     @PluginMethod
+    fun setLiveShieldArmed(call: PluginCall) {
+        try {
+            val armed = call.getBoolean("armed", true) ?: true
+            val policyObj = call.getObject("policy")
+            val dnsSinkhole = policyObj?.getBoolean("dnsSinkholeEnabled", true) ?: true
+            val dgaGuard = policyObj?.getBoolean("dgaEntropyGuard", true) ?: true
+            val punycodeBlock = policyObj?.getBoolean("punycodeHomographBlock", true) ?: true
+            val ddnsBlock = policyObj?.getBoolean("dynamicDnsC2Block", true) ?: true
+            val overlayShield = policyObj?.getBoolean("overlayTapjackShield", true) ?: true
+            val usbWatchdog = policyObj?.getBoolean("usbAdbWatchdog", true) ?: true
+
+            val blockedList = extractStringList(call.getArray("blockedDomains"))
+            LocalLoopbackVpnService.updateSinkholePolicy(
+                dgaGuard = dgaGuard,
+                punycodeBlock = punycodeBlock,
+                ddnsBlock = ddnsBlock,
+                blockedDomains = blockedList
+            )
+
+            if (!armed) {
+                liveShieldMonitor.disarm(activity)
+                stopLocalVpnService()
+                pluginScope.launch(Dispatchers.IO) {
+                    call.resolve(liveShieldMonitor.captureTelemetrySnapshot())
+                }
+                return
+            }
+
+            liveShieldMonitor.arm(
+                activity = activity,
+                enableOverlayShield = overlayShield,
+                enableUsbWatchdog = usbWatchdog
+            )
+
+            if (dnsSinkhole) {
+                val prepareIntent = VpnService.prepare(context)
+                if (prepareIntent != null) {
+                    val hostActivity = activity
+                    if (hostActivity != null && !hostActivity.isFinishing && !hostActivity.isDestroyed) {
+                        pendingShieldDnsEnable = true
+                        hostActivity.runOnUiThread {
+                            runCatching {
+                                startActivityForResult(call, prepareIntent, "onShieldVpnConsentResult")
+                            }.onFailure {
+                                pendingShieldDnsEnable = false
+                                pluginScope.launch(Dispatchers.IO) {
+                                    call.resolve(liveShieldMonitor.captureTelemetrySnapshot())
+                                }
+                            }
+                        }
+                        return
+                    }
+                } else {
+                    startLocalVpnServiceInternal()
+                }
+            } else {
+                stopLocalVpnService()
+            }
+
+            pluginScope.launch(Dispatchers.IO) {
+                call.resolve(liveShieldMonitor.captureTelemetrySnapshot())
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "setLiveShieldArmed error", t)
+            pluginScope.launch(Dispatchers.IO) {
+                val fallback = runCatching { liveShieldMonitor.captureTelemetrySnapshot() }
+                    .getOrDefault(JSObject().apply { put("shieldArmed", false) })
+                call.resolve(fallback)
+            }
+        }
+    }
+
+    @ActivityCallback
+    fun onShieldVpnConsentResult(call: PluginCall?, result: ActivityResult) {
+        if (call == null) return
+        if (result.resultCode == Activity.RESULT_OK && pendingShieldDnsEnable) {
+            startLocalVpnServiceInternal()
+        }
+        pendingShieldDnsEnable = false
+        pluginScope.launch(Dispatchers.IO) {
+            val snap = runCatching { liveShieldMonitor.captureTelemetrySnapshot() }
+                .getOrDefault(JSObject().apply { put("shieldArmed", liveShieldMonitor.isArmed) })
+            call.resolve(snap)
+        }
+    }
+
+    @PluginMethod
+    fun getLiveShieldSnapshot(call: PluginCall) {
+        pluginScope.launch(Dispatchers.IO) {
+            val snap = runCatching {
+                liveShieldMonitor.captureTelemetrySnapshot()
+            }.getOrElse { err ->
+                Log.e(TAG, "getLiveShieldSnapshot error", err)
+                JSObject().apply {
+                    put("shieldArmed", false)
+                    put("vpnTunnelActive", LocalLoopbackVpnService.isTunnelRunning)
+                    put("overlayShieldActive", false)
+                    put("userRootCaCount", 0)
+                    put("userRootCaSubjects", JSArray())
+                    put("fridaOrXposedDetected", false)
+                    put("debuggerAttached", false)
+                    put("rootIndicatorsFound", false)
+                    put("usbAdbEnabled", false)
+                    put("wirelessAdbEnabled", false)
+                    put("httpProxyHost", JSObject.NULL)
+                    put("enabledAccessibilityPackages", JSArray())
+                    put("inspectedDnsQueries", 0)
+                    put("blockedDnsQueries", 0)
+                    put("recentEvents", JSArray())
+                }
+            }
+            call.resolve(snap)
+        }
+    }
+
+    @PluginMethod
+    fun syncBlockedDomains(call: PluginCall) {
+        val policyObj = call.getObject("policy")
+        val dgaGuard = policyObj?.getBoolean("dgaEntropyGuard", true) ?: true
+        val punycodeBlock = policyObj?.getBoolean("punycodeHomographBlock", true) ?: true
+        val ddnsBlock = policyObj?.getBoolean("dynamicDnsC2Block", true) ?: true
+        val overlayShield = policyObj?.getBoolean("overlayTapjackShield", true) ?: true
+        val usbWatchdog = policyObj?.getBoolean("usbAdbWatchdog", true) ?: true
+        val blockedList = extractStringList(call.getArray("blockedDomains"))
+
+        LocalLoopbackVpnService.updateSinkholePolicy(
+            dgaGuard = dgaGuard,
+            punycodeBlock = punycodeBlock,
+            ddnsBlock = ddnsBlock,
+            blockedDomains = blockedList
+        )
+        if (::liveShieldMonitor.isInitialized && liveShieldMonitor.isArmed) {
+            liveShieldMonitor.usbAdbWatchdogEnabled = usbWatchdog
+            liveShieldMonitor.applyWindowProtection(activity, overlayShield)
+        }
+        call.resolve(JSObject().apply { put("syncedCount", blockedList.size) })
+    }
+
+    @PluginMethod
     fun toggleLocalVpn(call: PluginCall) {
         try {
             val enable = call.getBoolean("enable", true) ?: true
             if (!enable) {
-                runCatching {
-                    val stopIntent = Intent(context, LocalLoopbackVpnService::class.java).apply {
-                        action = LocalLoopbackVpnService.ACTION_STOP
-                    }
-                    context.startService(stopIntent)
-                }
+                stopLocalVpnService()
                 call.resolve(
                     JSObject().apply {
                         put("active", false)
@@ -235,7 +384,13 @@ class AegisSecurityPlugin : Plugin() {
                     }
                 }
             } else {
-                launchLocalVpnService(call)
+                val started = startLocalVpnServiceInternal()
+                call.resolve(
+                    JSObject().apply {
+                        put("active", started)
+                        put("interfaceName", if (started) "tun0" else "wlan0")
+                    }
+                )
             }
         } catch (t: Throwable) {
             Log.e(TAG, "toggleLocalVpn error", t)
@@ -253,7 +408,13 @@ class AegisSecurityPlugin : Plugin() {
         if (call == null) return
         try {
             if (result.resultCode == Activity.RESULT_OK) {
-                launchLocalVpnService(call)
+                val started = startLocalVpnServiceInternal()
+                call.resolve(
+                    JSObject().apply {
+                        put("active", started)
+                        put("interfaceName", if (started) "tun0" else "wlan0")
+                    }
+                )
             } else {
                 call.resolve(
                     JSObject().apply {
@@ -273,8 +434,8 @@ class AegisSecurityPlugin : Plugin() {
         }
     }
 
-    private fun launchLocalVpnService(call: PluginCall) {
-        val started = runCatching {
+    private fun startLocalVpnServiceInternal(): Boolean {
+        return runCatching {
             val startIntent = Intent(context, LocalLoopbackVpnService::class.java).apply {
                 action = LocalLoopbackVpnService.ACTION_START
             }
@@ -284,12 +445,35 @@ class AegisSecurityPlugin : Plugin() {
             Log.e(TAG, "Failed to start LocalLoopbackVpnService", err)
             false
         }
-        call.resolve(
-            JSObject().apply {
-                put("active", started)
-                put("interfaceName", if (started) "tun0" else "wlan0")
+    }
+
+    private fun stopLocalVpnService() {
+        runCatching {
+            val stopIntent = Intent(context, LocalLoopbackVpnService::class.java).apply {
+                action = LocalLoopbackVpnService.ACTION_STOP
             }
-        )
+            context.startService(stopIntent)
+        }
+    }
+
+    @PluginMethod
+    fun openAppSettings(call: PluginCall) {
+        val pkgName = call.getString("packageName")?.trim().orEmpty()
+        if (pkgName.isEmpty()) {
+            call.reject("packageName is required")
+            return
+        }
+        val opened = runCatching {
+            val settingsIntent = Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", pkgName, null)
+            ).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(settingsIntent)
+            true
+        }.getOrDefault(false)
+        call.resolve(JSObject().apply { put("opened", opened) })
     }
 
     @PluginMethod
@@ -380,7 +564,7 @@ class AegisSecurityPlugin : Plugin() {
                 JSObject().apply {
                     put("deviceLockSecure", true)
                     put("lockMethod", "Biometric + PIN")
-                    put("securityPatchDate", Build.VERSION.SECURITY_PATCH.ifBlank { "2026-01-01" })
+                    put("securityPatchDate", Build.VERSION.SECURITY_PATCH)
                     put("playProtectEnabled", true)
                     put("adbDebuggingEnabled", false)
                     put("unknownSourcesAllowed", false)
@@ -447,7 +631,24 @@ class AegisSecurityPlugin : Plugin() {
         )
     }
 
+    private fun extractStringList(array: JSArray?): List<String> {
+        if (array == null) return emptyList()
+        val out = mutableListOf<String>()
+        for (i in 0 until array.length()) {
+            val item = runCatching { array.getString(i) }.getOrNull()?.trim()
+            if (!item.isNullOrEmpty()) {
+                out += item
+            }
+        }
+        return out
+    }
+
     override fun handleOnDestroy() {
+        runCatching {
+            if (::liveShieldMonitor.isInitialized) {
+                liveShieldMonitor.shutdown(activity)
+            }
+        }
         pluginScope.cancel()
         super.handleOnDestroy()
     }

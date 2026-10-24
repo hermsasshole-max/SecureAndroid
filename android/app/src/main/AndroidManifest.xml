@@ -13,11 +13,12 @@
         android:usesPermissionFlags="neverForLocation"
         tools:targetApi="tiramisu" />
 
-    <!-- 2. Local Loopback VpnService & Non-WebView Link Expansion -->
+    <!-- 2. Local Loopback VpnService, Live Shield Overlay Guard & Non-WebView Link Expansion -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
 
     <!-- 3. Installed Package Spyware & Permission Auditor -->
     <uses-permission

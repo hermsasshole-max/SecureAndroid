@@ -159,6 +159,16 @@ export class EncryptedPreferencesVault {
     return JSON.parse(jsonStr) as T;
   }
 
+  removeEntry(key: string): void {
+    this.storage.removeItem(key);
+  }
+
+  removeKeys(keys: string[]): void {
+    for (const key of keys) {
+      this.storage.removeItem(key);
+    }
+  }
+
   inspectEncryptedEntries(): EncryptedVaultEntry[] {
     return this.storage
       .keys()

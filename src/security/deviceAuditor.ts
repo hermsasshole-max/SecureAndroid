@@ -161,7 +161,7 @@ export function auditInstalledPackages(packages: InstalledAppPackage[]): Package
 
 export function evaluateDevicePosture(
   state: DeviceHealthState,
-  referenceDateIso = '2026-10-23'
+  referenceDateIso: string = new Date().toISOString().slice(0, 10)
 ): DevicePostureReport {
   const refMs = Date.parse(`${referenceDateIso}T00:00:00Z`);
   const patchMs = Date.parse(`${state.securityPatchDate}T00:00:00Z`);
@@ -225,29 +225,29 @@ export function evaluateDevicePosture(
     detail: state.playProtectEnabled
       ? 'On-device potentially harmful app (PHA) verification is active.'
       : 'Play Protect verification is disabled; sideloaded trojans will not be flagged at install time.',
-    androidApiSource: 'SafetyNetVerifyAppsApi / PlayIntegrity',
+    androidApiSource: 'Settings.Global(package_verifier_enable)',
   });
 
   // 4. USB / Wireless ADB Debugging
   checks.push({
     id: 'adb-status',
-    label: 'ADB Debugging Interface',
+    label: 'USB & Wireless ADB Debugging',
     status: state.adbDebuggingEnabled ? ThreatSeverity.WARNING : ThreatSeverity.NOMINAL,
     detail: state.adbDebuggingEnabled
-      ? 'ADB debugging is enabled; malicious charging kiosks (Juice Jacking) can prompt shell pairing.'
-      : 'ADB interface disabled in Settings.Global.ADB_ENABLED.',
-    androidApiSource: 'Settings.Global.ADB_ENABLED',
+      ? 'USB or Wireless ADB debugging is enabled; malicious charging kiosks or LAN attackers can attempt shell pairing.'
+      : 'USB & Wireless ADB interfaces disabled in Settings.Global.',
+    androidApiSource: 'Settings.Global(adb_enabled / adb_wifi_enabled)',
   });
 
-  // 5. Unknown Sources Sideloading
+  // 5. Unknown Sources / Sideload Provenance
   checks.push({
     id: 'sideload-sources',
-    label: 'Unknown Package Install Grants',
+    label: 'Sideload & Unknown Installer Provenance',
     status: state.unknownSourcesAllowed ? ThreatSeverity.WARNING : ThreatSeverity.NOMINAL,
     detail: state.unknownSourcesAllowed
-      ? 'One or more browsers/file managers hold OP_REQUEST_INSTALL_PACKAGES permission.'
-      : 'Zero untrusted apps permitted to stage APK installations.',
-    androidApiSource: 'PackageManager.canRequestPackageInstalls()',
+      ? 'Detected non-store sideloaded packages or non-market installation setting enabled.'
+      : 'Zero untrusted sideloaded packages or non-market installer flags detected.',
+    androidApiSource: 'PackageManager.getInstallSourceInfo()',
   });
 
   let overallSeverity = ThreatSeverity.NOMINAL;

@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { TopNav, WorkspaceTab } from './components/TopNav';
+import { LiveShieldView } from './components/LiveShieldView';
 import { WifiInspectorView } from './components/WifiInspectorView';
 import { LinkAnalyzerView } from './components/LinkAnalyzerView';
 import { DeviceAuditorView } from './components/DeviceAuditorView';
@@ -12,8 +13,13 @@ import { AndroidBlueprintView } from './components/AndroidBlueprintView';
 import {
   BssidBaseline,
   DeviceHealthState,
+  DnsSinkholeVerdict,
   EncryptedVaultEntry,
   InstalledAppPackage,
+  IntrusionEvent,
+  LiveShieldPolicy,
+  RawShieldTelemetry,
+  ThreatSeverity,
   UrlAnalysisResult,
   WifiAccessPoint,
 } from './security/types';
@@ -21,39 +27,120 @@ import {
   BrowserLocalStorageAdapter,
   EncryptedPreferencesVault,
 } from './security/encryptedVault';
-import {
-  INITIAL_BSSID_BASELINES,
-  INITIAL_DEVICE_HEALTH,
-  INITIAL_INSTALLED_PACKAGES,
-  INITIAL_WIFI_SCAN,
-} from './data/seedData';
+import { DEFAULT_LIVE_SHIELD_POLICY, normalizeDomainInput } from './security/liveShield';
 import { ARCHITECTURE_LAYERS, BLUEPRINT_FILES } from './data/androidBlueprints';
 import {
   AegisSecurityNative,
+  NativeLiveShieldSnapshot,
   isRunningOnAndroidNative,
   mapSecurityStringToEnum,
 } from './native/aegisBridge';
 
+const VAULT_KEYS = {
+  WIFI_BASELINES: 'wifi_bssid_baselines_v2',
+  URL_HISTORY: 'url_audit_history_v2',
+  SHIELD_POLICY: 'live_shield_policy_v2',
+  SHIELD_BLOCKLIST: 'live_shield_blocklist_v2',
+  SHIELD_EVENTS: 'live_shield_events_v2',
+} as const;
+
+const LEGACY_DEMO_KEYS = [
+  'wifi_bssid_baselines_v1',
+  'device_posture_state_v1',
+  'url_audit_history_v1',
+];
+
 function getInitialTabFromQuery(): WorkspaceTab {
-  if (typeof window === 'undefined') return 'wifi';
+  if (typeof window === 'undefined') return 'shield';
   const params = new URLSearchParams(window.location.search);
   const tab = params.get('tab');
-  if (tab === 'links' || tab === 'device' || tab === 'blueprint' || tab === 'wifi') {
+  if (
+    tab === 'shield' ||
+    tab === 'wifi' ||
+    tab === 'links' ||
+    tab === 'device' ||
+    tab === 'blueprint'
+  ) {
     return tab;
   }
-  return 'wifi';
+  return 'shield';
+}
+
+function createInitialShieldTelemetry(): RawShieldTelemetry {
+  const isAndroid = isRunningOnAndroidNative();
+  return {
+    platform: isAndroid ? 'android-native' : 'web-browser',
+    shieldArmed: false,
+    vpnTunnelActive: false,
+    overlayShieldActive: false,
+    secureTransportTls: typeof window !== 'undefined' ? Boolean(window.isSecureContext) : true,
+    malwareDnsReachable: null,
+    malwareDnsLatencyMs: null,
+    userRootCaCount: null,
+    userRootCaSubjects: [],
+    fridaOrXposedDetected: null,
+    debuggerAttached: null,
+    rootIndicatorsFound: null,
+    usbAdbEnabled: null,
+    wirelessAdbEnabled: null,
+    httpProxyHost: null,
+    enabledAccessibilityPackages: [],
+    domInjectionCount: 0,
+    inspectedDnsQueries: 0,
+    blockedDnsQueries: 0,
+    lastSweepIso: null,
+  };
+}
+
+function mapNativeSnapshotToTelemetry(snapshot: NativeLiveShieldSnapshot): RawShieldTelemetry {
+  return {
+    platform: 'android-native',
+    shieldArmed: snapshot.shieldArmed,
+    vpnTunnelActive: snapshot.vpnTunnelActive,
+    overlayShieldActive: snapshot.overlayShieldActive,
+    secureTransportTls: true,
+    malwareDnsReachable: snapshot.vpnTunnelActive ? true : null,
+    malwareDnsLatencyMs: null,
+    userRootCaCount: snapshot.userRootCaCount,
+    userRootCaSubjects: snapshot.userRootCaSubjects ?? [],
+    fridaOrXposedDetected: snapshot.fridaOrXposedDetected,
+    debuggerAttached: snapshot.debuggerAttached,
+    rootIndicatorsFound: snapshot.rootIndicatorsFound,
+    usbAdbEnabled: snapshot.usbAdbEnabled,
+    wirelessAdbEnabled: snapshot.wirelessAdbEnabled,
+    httpProxyHost: snapshot.httpProxyHost ?? null,
+    enabledAccessibilityPackages: snapshot.enabledAccessibilityPackages ?? [],
+    domInjectionCount: 0,
+    inspectedDnsQueries: snapshot.inspectedDnsQueries ?? 0,
+    blockedDnsQueries: snapshot.blockedDnsQueries ?? 0,
+    lastSweepIso: snapshot.checkedAtIso ?? new Date().toISOString(),
+  };
 }
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>(getInitialTabFromQuery);
-  const [accessPoints, setAccessPoints] = useState<WifiAccessPoint[]>(INITIAL_WIFI_SCAN);
-  const [baselines, setBaselines] = useState<BssidBaseline[]>(INITIAL_BSSID_BASELINES);
-  const [vpnLoopbackActive, setVpnLoopbackActive] = useState<boolean>(
-    () => !isRunningOnAndroidNative()
-  );
+
+  // Zero demo/seed data: all states start empty or null until populated by real OS scans or user input
+  const [accessPoints, setAccessPoints] = useState<WifiAccessPoint[]>([]);
+  const [baselines, setBaselines] = useState<BssidBaseline[]>([]);
+  const [vpnLoopbackActive, setVpnLoopbackActive] = useState<boolean>(false);
+  const [isScanningWifi, setIsScanningWifi] = useState<boolean>(false);
+  const [wifiScanMessage, setWifiScanMessage] = useState<string | null>(null);
+
   const [recentUrlAnalyses, setRecentUrlAnalyses] = useState<UrlAnalysisResult[]>([]);
-  const [packages, setPackages] = useState<InstalledAppPackage[]>(INITIAL_INSTALLED_PACKAGES);
-  const [deviceHealth, setDeviceHealth] = useState<DeviceHealthState>(INITIAL_DEVICE_HEALTH);
+  const [packages, setPackages] = useState<InstalledAppPackage[]>([]);
+  const [deviceHealth, setDeviceHealth] = useState<DeviceHealthState | null>(null);
+  const [isAuditingDevice, setIsAuditingDevice] = useState<boolean>(false);
+  const [deviceAuditMessage, setDeviceAuditMessage] = useState<string | null>(null);
+
+  const [shieldPolicy, setShieldPolicy] = useState<LiveShieldPolicy>(DEFAULT_LIVE_SHIELD_POLICY);
+  const [shieldTelemetry, setShieldTelemetry] = useState<RawShieldTelemetry>(
+    createInitialShieldTelemetry
+  );
+  const [shieldEvents, setShieldEvents] = useState<IntrusionEvent[]>([]);
+  const [customBlockedDomains, setCustomBlockedDomains] = useState<string[]>([]);
+  const [isSweepingShield, setIsSweepingShield] = useState<boolean>(false);
+
   const [encryptedEntries, setEncryptedEntries] = useState<EncryptedVaultEntry[]>([]);
   const [interceptedIntent, setInterceptedIntent] = useState<{
     url: string;
@@ -65,13 +152,138 @@ export default function App() {
     []
   );
 
-  // Hydrate AES-256-GCM EncryptedPreferencesVault + Android Capacitor Native APIs on mount
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
+  const refreshVaultEntries = useCallback(() => {
+    setEncryptedEntries(vault.inspectEncryptedEntries());
+  }, [vault]);
+
+  const appendIntrusionEvent = useCallback(
+    async (event: IntrusionEvent) => {
+      setShieldEvents((prev) => {
+        if (prev.some((existing) => existing.id === event.id)) {
+          return prev;
+        }
+        const next = [event, ...prev].slice(0, 50);
+        void vault.putEncrypted(VAULT_KEYS.SHIELD_EVENTS, next).then(refreshVaultEntries);
+        return next;
+      });
+    },
+    [vault, refreshVaultEntries]
+  );
+
+  const runShieldIntegritySweep = useCallback(
+    async (armedOverride?: boolean) => {
+      setIsSweepingShield(true);
       try {
         if (isRunningOnAndroidNative()) {
-          // 1. Check if launched via Android Browser Picker ACTION_VIEW intent
+          const snapshot = await AegisSecurityNative.getLiveShieldSnapshot();
+          setShieldTelemetry(mapNativeSnapshotToTelemetry(snapshot));
+          setVpnLoopbackActive(snapshot.vpnTunnelActive);
+          if (snapshot.recentEvents?.length) {
+            setShieldEvents((prev) => {
+              const seen = new Set(prev.map((e) => e.id));
+              const merged = [
+                ...snapshot.recentEvents.filter((e) => !seen.has(e.id)),
+                ...prev,
+              ].slice(0, 50);
+              void vault.putEncrypted(VAULT_KEYS.SHIELD_EVENTS, merged).then(refreshVaultEntries);
+              return merged;
+            });
+          }
+        } else {
+          let dnsReachable: boolean | null = null;
+          let dnsLatencyMs: number | null = null;
+
+          try {
+            const resp = await fetch('/api/shield-probe', {
+              headers: { Accept: 'application/json' },
+            });
+            if (resp.ok) {
+              const data = (await resp.json()) as {
+                reachable?: boolean;
+                latencyMs?: number;
+              };
+              dnsReachable = Boolean(data.reachable);
+              dnsLatencyMs = typeof data.latencyMs === 'number' ? data.latencyMs : null;
+            } else {
+              dnsReachable = false;
+            }
+          } catch {
+            dnsReachable = false;
+          }
+
+          const secureTls =
+            typeof window !== 'undefined' ? Boolean(window.isSecureContext) : true;
+          const nowIso = new Date().toISOString();
+
+          setShieldTelemetry((prev) => ({
+            ...prev,
+            shieldArmed: armedOverride ?? prev.shieldArmed,
+            secureTransportTls: secureTls,
+            malwareDnsReachable: dnsReachable,
+            malwareDnsLatencyMs: dnsLatencyMs,
+            lastSweepIso: nowIso,
+          }));
+        }
+      } catch {
+        // Keep current telemetry on transient error
+      } finally {
+        setIsSweepingShield(false);
+      }
+    },
+    [vault, refreshVaultEntries]
+  );
+
+  // Hydrate AES-256-GCM Vault (purging any legacy _v1 demo keys) and connect Android native listeners
+  useEffect(() => {
+    let cancelled = false;
+    let alertListenerPromise: ReturnType<typeof AegisSecurityNative.addListener> | null = null;
+
+    (async () => {
+      try {
+        // Purge legacy v1 seed keys so zero demo artifacts remain in storage
+        vault.removeKeys(LEGACY_DEMO_KEYS);
+
+        const [
+          storedBaselines,
+          storedLinks,
+          storedPolicy,
+          storedBlocklist,
+          storedEvents,
+        ] = await Promise.all([
+          vault.getDecrypted<BssidBaseline[]>(VAULT_KEYS.WIFI_BASELINES).catch(() => null),
+          vault.getDecrypted<UrlAnalysisResult[]>(VAULT_KEYS.URL_HISTORY).catch(() => null),
+          vault.getDecrypted<LiveShieldPolicy>(VAULT_KEYS.SHIELD_POLICY).catch(() => null),
+          vault.getDecrypted<string[]>(VAULT_KEYS.SHIELD_BLOCKLIST).catch(() => null),
+          vault.getDecrypted<IntrusionEvent[]>(VAULT_KEYS.SHIELD_EVENTS).catch(() => null),
+        ]);
+
+        const effectivePolicy = storedPolicy ?? DEFAULT_LIVE_SHIELD_POLICY;
+        const effectiveBlocklist = storedBlocklist ?? [];
+
+        if (!cancelled) {
+          if (storedBaselines) setBaselines(storedBaselines);
+          if (storedLinks) setRecentUrlAnalyses(storedLinks);
+          if (storedPolicy) setShieldPolicy(storedPolicy);
+          if (storedBlocklist) setCustomBlockedDomains(storedBlocklist);
+          if (storedEvents) setShieldEvents(storedEvents);
+          refreshVaultEntries();
+        }
+
+        if (isRunningOnAndroidNative()) {
+          alertListenerPromise = AegisSecurityNative.addListener('shieldAlert', (event) => {
+            if (!cancelled && event) {
+              void appendIntrusionEvent(event);
+              void AegisSecurityNative.getLiveShieldSnapshot()
+                .then((snap) => {
+                  if (!cancelled) {
+                    setShieldTelemetry(mapNativeSnapshotToTelemetry(snap));
+                    setVpnLoopbackActive(snap.vpnTunnelActive);
+                  }
+                })
+                .catch(() => null);
+            }
+          });
+
           const pending = await AegisSecurityNative.consumePendingInterceptUrl().catch(() => null);
           if (!cancelled && pending?.interceptedUrl) {
             setInterceptedIntent({
@@ -81,9 +293,8 @@ export default function App() {
             setActiveTab('links');
           }
 
-          // 2. Load hardware-backed EncryptedSharedPreferences baselines
           const encBaselines = await AegisSecurityNative.getEncryptedString({
-            key: 'wifi_bssid_baselines_v1',
+            key: VAULT_KEYS.WIFI_BASELINES,
           }).catch(() => ({ value: null }));
           if (!cancelled && encBaselines.value) {
             try {
@@ -93,18 +304,31 @@ export default function App() {
             }
           }
 
-          // 3. Scan device posture & installed packages first, then request/run Wi-Fi scan
           const [pkgRes, healthRes] = await Promise.all([
             AegisSecurityNative.scanInstalledPackages().catch(() => ({ packages: [] })),
             AegisSecurityNative.getDeviceHealthState().catch(() => null),
           ]);
 
           if (!cancelled) {
-            if (pkgRes.packages.length > 0) {
-              setPackages(pkgRes.packages);
+            setPackages(pkgRes.packages);
+            if (healthRes) setDeviceHealth(healthRes);
+          }
+
+          if (effectivePolicy.enabled) {
+            const snap = await AegisSecurityNative.setLiveShieldArmed({
+              armed: true,
+              policy: effectivePolicy,
+              blockedDomains: effectiveBlocklist,
+            }).catch(() => null);
+            if (!cancelled && snap) {
+              setShieldTelemetry(mapNativeSnapshotToTelemetry(snap));
+              setVpnLoopbackActive(snap.vpnTunnelActive);
             }
-            if (healthRes) {
-              setDeviceHealth(healthRes);
+          } else {
+            const snap = await AegisSecurityNative.getLiveShieldSnapshot().catch(() => null);
+            if (!cancelled && snap) {
+              setShieldTelemetry(mapNativeSnapshotToTelemetry(snap));
+              setVpnLoopbackActive(snap.vpnTunnelActive);
             }
           }
 
@@ -112,8 +336,7 @@ export default function App() {
             permissionGranted: false,
             accessPoints: [],
           }));
-
-          if (!cancelled && wifiRes.permissionGranted && wifiRes.accessPoints.length > 0) {
+          if (!cancelled && wifiRes.permissionGranted) {
             setAccessPoints(
               wifiRes.accessPoints.map((ap) => ({
                 ...ap,
@@ -121,42 +344,209 @@ export default function App() {
               }))
             );
           }
-        }
-
-        const storedBaselines = await vault.getDecrypted<BssidBaseline[]>('wifi_bssid_baselines_v1');
-        if (!cancelled && storedBaselines && storedBaselines.length > 0 && !isRunningOnAndroidNative()) {
-          setBaselines(storedBaselines);
-        } else if (!isRunningOnAndroidNative()) {
-          await vault.putEncrypted('wifi_bssid_baselines_v1', INITIAL_BSSID_BASELINES);
-        }
-
-        const storedHealth = await vault.getDecrypted<DeviceHealthState>('device_posture_state_v1');
-        if (!cancelled && storedHealth && !isRunningOnAndroidNative()) {
-          setDeviceHealth(storedHealth);
-        } else {
-          await vault.putEncrypted('device_posture_state_v1', INITIAL_DEVICE_HEALTH);
-        }
-
-        const storedLinks = await vault.getDecrypted<UrlAnalysisResult[]>('url_audit_history_v1');
-        if (!cancelled && storedLinks) {
-          setRecentUrlAnalyses(storedLinks);
-        }
-
-        if (!cancelled) {
-          setEncryptedEntries(vault.inspectEncryptedEntries());
+        } else if (effectivePolicy.enabled && !cancelled) {
+          setShieldTelemetry((prev) => ({ ...prev, shieldArmed: true }));
+          await runShieldIntegritySweep(true);
         }
       } catch {
-        await vault.putEncrypted('wifi_bssid_baselines_v1', INITIAL_BSSID_BASELINES);
         if (!cancelled) {
-          setEncryptedEntries(vault.inspectEncryptedEntries());
+          refreshVaultEntries();
         }
       }
     })();
 
     return () => {
       cancelled = true;
+      if (alertListenerPromise) {
+        void alertListenerPromise.then((handle) => handle.remove()).catch(() => null);
+      }
     };
-  }, [vault]);
+  }, [vault, refreshVaultEntries, appendIntrusionEvent, runShieldIntegritySweep]);
+
+  // Real-time Web DOM MutationObserver for unauthorized cross-origin script/iframe injection when armed
+  useEffect(() => {
+    if (isRunningOnAndroidNative() || !shieldPolicy.enabled || typeof MutationObserver === 'undefined') {
+      return;
+    }
+
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        mutation.addedNodes.forEach((node) => {
+          if (!(node instanceof HTMLElement)) return;
+          const tag = node.tagName.toLowerCase();
+          if (tag !== 'script' && tag !== 'iframe') return;
+
+          const src = node.getAttribute('src') ?? '';
+          if (!src) return;
+
+          try {
+            const resolved = new URL(src, window.location.origin);
+            if (resolved.origin !== window.location.origin) {
+              setShieldTelemetry((prev) => ({
+                ...prev,
+                domInjectionCount: prev.domInjectionCount + 1,
+              }));
+              void appendIntrusionEvent({
+                id: `dom-inj-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                timestampIso: new Date().toISOString(),
+                surface: 'RASP_INTEGRITY',
+                severity: ThreatSeverity.CRITICAL,
+                title: `Untrusted <${tag}> injection detected`,
+                detail: `Runtime DOM MutationObserver caught an external ${tag.toUpperCase()} element pointing to ${resolved.origin}.`,
+                indicator: resolved.href,
+              });
+            }
+          } catch {
+            // Ignore relative non-URL attributes
+          }
+        });
+      }
+    });
+
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+
+    return () => observer.disconnect();
+  }, [shieldPolicy.enabled, appendIntrusionEvent]);
+
+  const handleToggleShieldArmed = async () => {
+    const nextArmed = !shieldPolicy.enabled;
+    const nextPolicy: LiveShieldPolicy = {
+      ...shieldPolicy,
+      enabled: nextArmed,
+    };
+    setShieldPolicy(nextPolicy);
+    await vault.putEncrypted(VAULT_KEYS.SHIELD_POLICY, nextPolicy);
+    refreshVaultEntries();
+
+    if (isRunningOnAndroidNative()) {
+      await AegisSecurityNative.putEncryptedString({
+        key: VAULT_KEYS.SHIELD_POLICY,
+        value: JSON.stringify(nextPolicy),
+      }).catch(() => null);
+
+      const snap = await AegisSecurityNative.setLiveShieldArmed({
+        armed: nextArmed,
+        policy: nextPolicy,
+        blockedDomains: customBlockedDomains,
+      }).catch(() => null);
+
+      if (snap) {
+        setShieldTelemetry(mapNativeSnapshotToTelemetry(snap));
+        setVpnLoopbackActive(snap.vpnTunnelActive);
+      }
+    } else {
+      setShieldTelemetry((prev) => ({
+        ...prev,
+        shieldArmed: nextArmed,
+      }));
+      setVpnLoopbackActive(nextArmed && nextPolicy.dnsSinkholeEnabled);
+      if (nextArmed) {
+        await runShieldIntegritySweep(true);
+      }
+    }
+  };
+
+  const handleUpdateShieldPolicy = async (nextPolicy: LiveShieldPolicy) => {
+    setShieldPolicy(nextPolicy);
+    await vault.putEncrypted(VAULT_KEYS.SHIELD_POLICY, nextPolicy);
+    refreshVaultEntries();
+
+    if (isRunningOnAndroidNative()) {
+      await AegisSecurityNative.putEncryptedString({
+        key: VAULT_KEYS.SHIELD_POLICY,
+        value: JSON.stringify(nextPolicy),
+      }).catch(() => null);
+
+      if (nextPolicy.enabled) {
+        const snap = await AegisSecurityNative.setLiveShieldArmed({
+          armed: true,
+          policy: nextPolicy,
+          blockedDomains: customBlockedDomains,
+        }).catch(() => null);
+        if (snap) {
+          setShieldTelemetry(mapNativeSnapshotToTelemetry(snap));
+          setVpnLoopbackActive(snap.vpnTunnelActive);
+        }
+      } else {
+        await AegisSecurityNative.syncBlockedDomains({
+          policy: nextPolicy,
+          blockedDomains: customBlockedDomains,
+        }).catch(() => null);
+      }
+    } else if (nextPolicy.enabled) {
+      setVpnLoopbackActive(nextPolicy.dnsSinkholeEnabled);
+    }
+  };
+
+  const handleAddBlockedDomain = async (rawDomain: string) => {
+    const normalized = normalizeDomainInput(rawDomain);
+    if (!normalized) return;
+
+    const nextList = Array.from(new Set([normalized, ...customBlockedDomains]));
+    setCustomBlockedDomains(nextList);
+    await vault.putEncrypted(VAULT_KEYS.SHIELD_BLOCKLIST, nextList);
+    refreshVaultEntries();
+
+    if (isRunningOnAndroidNative()) {
+      await AegisSecurityNative.putEncryptedString({
+        key: VAULT_KEYS.SHIELD_BLOCKLIST,
+        value: JSON.stringify(nextList),
+      }).catch(() => null);
+      await AegisSecurityNative.syncBlockedDomains({
+        policy: shieldPolicy,
+        blockedDomains: nextList,
+      }).catch(() => null);
+    }
+  };
+
+  const handleRemoveBlockedDomain = async (domainToRemove: string) => {
+    const nextList = customBlockedDomains.filter((d) => d !== domainToRemove);
+    if (nextList.length > 0) {
+      await vault.putEncrypted(VAULT_KEYS.SHIELD_BLOCKLIST, nextList);
+    } else {
+      vault.removeEntry(VAULT_KEYS.SHIELD_BLOCKLIST);
+    }
+    setCustomBlockedDomains(nextList);
+    refreshVaultEntries();
+
+    if (isRunningOnAndroidNative()) {
+      await AegisSecurityNative.putEncryptedString({
+        key: VAULT_KEYS.SHIELD_BLOCKLIST,
+        value: JSON.stringify(nextList),
+      }).catch(() => null);
+      await AegisSecurityNative.syncBlockedDomains({
+        policy: shieldPolicy,
+        blockedDomains: nextList,
+      }).catch(() => null);
+    }
+  };
+
+  const handleRecordEvaluatedBlock = (verdict: DnsSinkholeVerdict) => {
+    setShieldTelemetry((prev) => ({
+      ...prev,
+      inspectedDnsQueries: prev.inspectedDnsQueries + 1,
+      blockedDnsQueries: prev.blockedDnsQueries + (verdict.blocked ? 1 : 0),
+    }));
+
+    void appendIntrusionEvent({
+      id: `dns-eval-${Date.now()}-${verdict.domain}`,
+      timestampIso: new Date().toISOString(),
+      surface: 'DNS_SINKHOLE',
+      severity: verdict.severity,
+      title: `DNS Sinkhole blocked ${verdict.domain}`,
+      detail: verdict.reasons[0] ?? `Matched rule ${verdict.matchedRule}.`,
+      indicator: `${verdict.matchedRule} · H=${verdict.shannonEntropy.toFixed(2)}`,
+    });
+  };
+
+  const handleClearShieldEvents = () => {
+    setShieldEvents([]);
+    vault.removeEntry(VAULT_KEYS.SHIELD_EVENTS);
+    refreshVaultEntries();
+  };
 
   const handleToggleVpnLoopback = async () => {
     const nextState = !vpnLoopbackActive;
@@ -166,10 +556,45 @@ export default function App() {
         setVpnLoopbackActive(res.active);
         return;
       } catch {
-        // Fallback to local UI state
+        setWifiScanMessage('Android VpnService consent was cancelled or unavailable.');
+        return;
       }
     }
     setVpnLoopbackActive(nextState);
+  };
+
+  const handleScanWifi = async () => {
+    setIsScanningWifi(true);
+    setWifiScanMessage(null);
+    try {
+      if (isRunningOnAndroidNative()) {
+        const wifiRes = await AegisSecurityNative.scanWifiNetworks({ forcePrompt: true });
+        if (!wifiRes.permissionGranted) {
+          setWifiScanMessage(
+            'Location permission is required by Android OS to read Wi-Fi BSSID hardware addresses.'
+          );
+          return;
+        }
+        const mapped = wifiRes.accessPoints.map((ap) => ({
+          ...ap,
+          protocol: mapSecurityStringToEnum(String(ap.protocol)),
+        }));
+        setAccessPoints(mapped);
+        setWifiScanMessage(
+          mapped.length > 0
+            ? `Scanned ${mapped.length} nearby 802.11 access point(s) via Android WifiManager.`
+            : 'WifiManager scan completed: 0 nearby access points returned by OS.'
+        );
+      } else {
+        setWifiScanMessage(
+          'Browser sandboxes cannot read raw 802.11 BSSID frames. Install the Android APK to scan live nearby Wi-Fi radios via WifiManager.'
+        );
+      }
+    } catch {
+      setWifiScanMessage('Wi-Fi radio scan could not complete on this device.');
+    } finally {
+      setIsScanningWifi(false);
+    }
   };
 
   const handlePinBaseline = async (ap: WifiAccessPoint) => {
@@ -194,85 +619,70 @@ export default function App() {
     setBaselines(nextBaselines);
     if (isRunningOnAndroidNative()) {
       await AegisSecurityNative.putEncryptedString({
-        key: 'wifi_bssid_baselines_v1',
+        key: VAULT_KEYS.WIFI_BASELINES,
         value: JSON.stringify(nextBaselines),
       }).catch(() => null);
     }
-    await vault.putEncrypted('wifi_bssid_baselines_v1', nextBaselines);
-    setEncryptedEntries(vault.inspectEncryptedEntries());
+    await vault.putEncrypted(VAULT_KEYS.WIFI_BASELINES, nextBaselines);
+    refreshVaultEntries();
   };
 
-  const handleAddAccessPoint = (ap: WifiAccessPoint) => {
-    setAccessPoints((prev) => [ap, ...prev]);
-  };
-
-  const handleSimulateGatewaySpoof = () => {
-    setAccessPoints((prev) =>
-      prev.map((ap) =>
-        ap.isConnected
-          ? {
-              ...ap,
-              gatewayMac: 'DE:AD:BE:EF:44:19',
-              dnsServers: ['185.199.108.153'],
-            }
-          : ap
-      )
-    );
-  };
-
-  const handleResetScan = async () => {
+  const handleClearBaselines = async () => {
+    setBaselines([]);
+    vault.removeEntry(VAULT_KEYS.WIFI_BASELINES);
     if (isRunningOnAndroidNative()) {
-      const wifiRes = await AegisSecurityNative.scanWifiNetworks({ forcePrompt: true }).catch(
-        () => ({
-          permissionGranted: false,
-          accessPoints: [],
-        })
-      );
-      if (wifiRes.permissionGranted && wifiRes.accessPoints.length > 0) {
-        setAccessPoints(
-          wifiRes.accessPoints.map((ap) => ({
-            ...ap,
-            protocol: mapSecurityStringToEnum(String(ap.protocol)),
-          }))
-        );
-      } else {
-        setAccessPoints(INITIAL_WIFI_SCAN);
-      }
       await AegisSecurityNative.putEncryptedString({
-        key: 'wifi_bssid_baselines_v1',
-        value: JSON.stringify(INITIAL_BSSID_BASELINES),
+        key: VAULT_KEYS.WIFI_BASELINES,
+        value: '[]',
       }).catch(() => null);
-    } else {
-      setAccessPoints(INITIAL_WIFI_SCAN);
-      setVpnLoopbackActive(true);
     }
-    setBaselines(INITIAL_BSSID_BASELINES);
-    await vault.putEncrypted('wifi_bssid_baselines_v1', INITIAL_BSSID_BASELINES);
-    setEncryptedEntries(vault.inspectEncryptedEntries());
+    refreshVaultEntries();
   };
 
   const handleRecordUrlAnalysis = async (result: UrlAnalysisResult) => {
     const next = [result, ...recentUrlAnalyses.filter((r) => r.inputUrl !== result.inputUrl)].slice(
       0,
-      8
+      12
     );
     setRecentUrlAnalyses(next);
-    await vault.putEncrypted('url_audit_history_v1', next);
-    setEncryptedEntries(vault.inspectEncryptedEntries());
+    await vault.putEncrypted(VAULT_KEYS.URL_HISTORY, next);
+    refreshVaultEntries();
   };
 
-  const handleUpdateDeviceHealth = async (next: DeviceHealthState) => {
-    setDeviceHealth(next);
-    await vault.putEncrypted('device_posture_state_v1', next);
-    setEncryptedEntries(vault.inspectEncryptedEntries());
+  const handleClearUrlHistory = () => {
+    setRecentUrlAnalyses([]);
+    vault.removeEntry(VAULT_KEYS.URL_HISTORY);
+    refreshVaultEntries();
   };
 
-  const handleAddPackage = (pkg: InstalledAppPackage) => {
-    setPackages((prev) => [pkg, ...prev.filter((p) => p.packageName !== pkg.packageName)]);
+  const handleRefreshDeviceAudit = async () => {
+    setIsAuditingDevice(true);
+    setDeviceAuditMessage(null);
+    try {
+      if (isRunningOnAndroidNative()) {
+        const [pkgRes, healthRes] = await Promise.all([
+          AegisSecurityNative.scanInstalledPackages().catch(() => ({ packages: [] })),
+          AegisSecurityNative.getDeviceHealthState().catch(() => null),
+        ]);
+        setPackages(pkgRes.packages);
+        if (healthRes) setDeviceHealth(healthRes);
+        setDeviceAuditMessage(
+          `Audited ${pkgRes.packages.length} installed user package(s) and hardware Keyguard posture.`
+        );
+      } else {
+        setDeviceAuditMessage(
+          'Browser sandboxes cannot enumerate installed Android APKs or hardware Keyguard state. Install the Android APK to run live PackageManager and OS posture audits.'
+        );
+      }
+    } finally {
+      setIsAuditingDevice(false);
+    }
   };
 
-  const handleUninstallPackage = (packageName: string) => {
-    setPackages((prev) => prev.filter((p) => p.packageName !== packageName));
+  const handleOpenAppSettings = async (packageName: string) => {
+    if (isRunningOnAndroidNative()) {
+      await AegisSecurityNative.openAppSettings({ packageName }).catch(() => null);
+    }
   };
 
   const handleExportBundle = () => {
@@ -324,24 +734,43 @@ export default function App() {
       />
 
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
+        {activeTab === 'shield' && (
+          <LiveShieldView
+            policy={shieldPolicy}
+            telemetry={shieldTelemetry}
+            events={shieldEvents}
+            customBlockedDomains={customBlockedDomains}
+            isSweeping={isSweepingShield}
+            onToggleShieldArmed={() => void handleToggleShieldArmed()}
+            onUpdatePolicy={(next) => void handleUpdateShieldPolicy(next)}
+            onRunIntegritySweep={() => void runShieldIntegritySweep()}
+            onAddBlockedDomain={(domain) => void handleAddBlockedDomain(domain)}
+            onRemoveBlockedDomain={(domain) => void handleRemoveBlockedDomain(domain)}
+            onRecordEvaluatedBlock={handleRecordEvaluatedBlock}
+            onClearEvents={handleClearShieldEvents}
+          />
+        )}
+
         {activeTab === 'wifi' && (
           <WifiInspectorView
             accessPoints={accessPoints}
             baselines={baselines}
             vpnLoopbackActive={vpnLoopbackActive}
             encryptedEntries={encryptedEntries}
+            isScanningWifi={isScanningWifi}
+            wifiScanMessage={wifiScanMessage}
             onToggleVpnLoopback={() => void handleToggleVpnLoopback()}
-            onPinBaseline={handlePinBaseline}
-            onAddAccessPoint={handleAddAccessPoint}
-            onSimulateGatewaySpoof={handleSimulateGatewaySpoof}
-            onResetScan={handleResetScan}
+            onPinBaseline={(ap) => void handlePinBaseline(ap)}
+            onScanWifi={() => void handleScanWifi()}
+            onClearBaselines={() => void handleClearBaselines()}
           />
         )}
 
         {activeTab === 'links' && (
           <LinkAnalyzerView
             recentAnalyses={recentUrlAnalyses}
-            onRecordAnalysis={handleRecordUrlAnalysis}
+            onRecordAnalysis={(res) => void handleRecordUrlAnalysis(res)}
+            onClearHistory={handleClearUrlHistory}
             interceptedIntent={interceptedIntent}
           />
         )}
@@ -350,9 +779,10 @@ export default function App() {
           <DeviceAuditorView
             packages={packages}
             deviceHealth={deviceHealth}
-            onUpdateDeviceHealth={handleUpdateDeviceHealth}
-            onAddPackage={handleAddPackage}
-            onUninstallPackage={handleUninstallPackage}
+            isAuditing={isAuditingDevice}
+            auditMessage={deviceAuditMessage}
+            onRefreshAudit={() => void handleRefreshDeviceAudit()}
+            onOpenAppSettings={(pkg) => void handleOpenAppSettings(pkg)}
           />
         )}
 
@@ -362,7 +792,7 @@ export default function App() {
       </main>
 
       <footer className="max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-        <span>AegisLocal Android Security Architecture · Non-Root On-Device Inspection</span>
+        <span>AegisLocal Android Security Architecture · Non-Root Real-Time Defense</span>
         <span>Persistence encrypted locally via AES-256-GCM</span>
       </footer>
     </div>

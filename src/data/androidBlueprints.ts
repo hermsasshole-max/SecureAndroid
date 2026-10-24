@@ -54,6 +54,17 @@ export const ARCHITECTURE_LAYERS = [
       'Auto-Backup (android:allowBackup="false") is disabled in AndroidManifest.xml so Keystore-bound ciphertexts are never exported or corrupted across cloud restores.',
     ],
   },
+  {
+    number: '05',
+    title: 'Real-Time Live Shield RASP & Intrusion Watchdog',
+    summary:
+      'Combines zero-polling Android OS BroadcastReceiver, NetworkCallback, ContentObserver, and Accessibility listeners with runtime memory and TLS certificate store integrity checks.',
+    details: [
+      'LocalLoopbackVpnService blocks high-entropy DGA beacons, Punycode homographs, and RAT Dynamic DNS C2 domains with immediate NXDOMAIN responses while forwarding clean queries to 1.1.1.2 / 9.9.9.9.',
+      'LiveShieldMonitor audits KeyStore("AndroidCAStore") for rogue user-installed MITM Root CAs and inspects /proc/self/maps for Frida, Xposed, or LSPosed instrumentation hooks.',
+      'Enforces Android 12+ Window.setHideOverlayWindows(true) (HIDE_OVERLAY_WINDOWS) and FLAG_SECURE to neutralize tapjacking overlays and screen-scraping stalkerware.',
+    ],
+  },
 ];
 
 export const BLUEPRINT_FILES: BlueprintCodeFile[] = [
@@ -1290,7 +1301,57 @@ class AegisSecurityPlugin : Plugin() {
     fun scanInstalledPackages(call: PluginCall) { /* PackageManager + AccessibilityManager */ }
 
     @PluginMethod
+    fun setLiveShieldArmed(call: PluginCall) { /* LiveShieldMonitor + LocalLoopbackVpnService DNS Sinkhole */ }
+
+    @PluginMethod
+    fun getLiveShieldSnapshot(call: PluginCall) { /* RASP /proc/self/maps + AndroidCAStore + ADB/Proxy sweep */ }
+
+    @PluginMethod
     fun putEncryptedString(call: PluginCall) { /* EncryptedSharedPreferences AES256-GCM */ }
+}`,
+  },
+  {
+    id: 'live-shield-monitor',
+    filename: 'LiveShieldMonitor.kt',
+    path: 'android/app/src/main/java/com/aegislocal/security/shield/LiveShieldMonitor.kt',
+    language: 'kotlin',
+    summary:
+      'Event-driven Android anti-intrusion & RASP watchdog monitoring sideloaded APKs, USB Juice-Jacking, Wireless ADB exploitation, HTTP MITM proxies, user TLS Root CAs, and Frida/Xposed memory hooks.',
+    edgeCases: [
+      'All OS BroadcastReceivers, ContentObservers, and Accessibility listeners are isolated inside runCatching blocks so OEM-specific SecurityExceptions never terminate the app process.',
+      'Window.setHideOverlayWindows(true) is guarded by Build.VERSION.SDK_INT >= Build.VERSION_CODES.S and dispatched strictly on the Activity UI thread.',
+    ],
+    performanceNotes: [
+      'Uses event-driven Android system callbacks (NetworkCallback, ContentObserver, BroadcastReceiver) with zero background polling loops for negligible battery impact.',
+    ],
+    code: `class LiveShieldMonitor(
+    private val context: Context,
+    private val onIntrusionAlert: (IntrusionAlertPayload) -> Unit
+) {
+    fun setArmed(activity: Activity?, enable: Boolean, overlayShield: Boolean, usbAdbWatchdog: Boolean) {
+        applyOverlayWindowProtection(activity, enable && overlayShield)
+        if (enable) {
+            registerPackageAndPowerWatchers()
+            registerNetworkProxyWatcher()
+            registerAdbSettingsObserver()
+            registerAccessibilityWatcher()
+        } else {
+            unregisterAllWatchers()
+        }
+    }
+
+    fun collectIntegritySnapshot(vpnActive: Boolean, inspectedDns: Long, blockedDns: Long): JSObject {
+        val userCerts = inspectUserInstalledRootCas() // KeyStore.getInstance("AndroidCAStore") user:* aliases
+        val fridaHooked = detectDynamicInstrumentationHooks() // /proc/self/maps frida/xposed/lsposed scan
+        val wirelessAdb = Settings.Global.getInt(context.contentResolver, "adb_wifi_enabled", 0) == 1
+        return JSObject()
+            .put("userRootCaCount", userCerts.size)
+            .put("fridaOrXposedDetected", fridaHooked)
+            .put("wirelessAdbEnabled", wirelessAdb)
+            .put("vpnTunnelActive", vpnActive)
+            .put("inspectedDnsQueries", inspectedDns)
+            .put("blockedDnsQueries", blockedDns)
+    }
 }`,
   },
 ];

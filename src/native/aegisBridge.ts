@@ -1,8 +1,10 @@
-import { Capacitor, registerPlugin } from '@capacitor/core';
+import { Capacitor, PluginListenerHandle, registerPlugin } from '@capacitor/core';
 import {
   DeviceHealthState,
   EncryptionProtocol,
   InstalledAppPackage,
+  IntrusionEvent,
+  LiveShieldPolicy,
   RedirectHop,
   WifiAccessPoint,
 } from '../security/types';
@@ -29,16 +31,50 @@ export interface NativePendingIntentResponse {
   callerPackage: string | null;
 }
 
+export interface NativeLiveShieldSnapshot {
+  shieldArmed: boolean;
+  vpnTunnelActive: boolean;
+  overlayShieldActive: boolean;
+  userRootCaCount: number;
+  userRootCaSubjects: string[];
+  fridaOrXposedDetected: boolean;
+  debuggerAttached: boolean;
+  rootIndicatorsFound: boolean;
+  usbAdbEnabled: boolean;
+  wirelessAdbEnabled: boolean;
+  httpProxyHost: string | null;
+  enabledAccessibilityPackages: string[];
+  inspectedDnsQueries: number;
+  blockedDnsQueries: number;
+  recentEvents: IntrusionEvent[];
+  checkedAtIso: string;
+}
+
 export interface AegisSecurityPluginContract {
   scanWifiNetworks(options?: { forcePrompt?: boolean }): Promise<NativeWifiScanResponse>;
   toggleLocalVpn(options: { enable: boolean }): Promise<NativeVpnStatusResponse>;
   expandUrlNative(options: { url: string }): Promise<NativeUrlExpansionResponse>;
   openVerifiedExternalBrowser(options: { url: string }): Promise<{ launched: boolean }>;
+  openAppSettings(options: { packageName: string }): Promise<{ opened: boolean }>;
   scanInstalledPackages(): Promise<{ packages: InstalledAppPackage[] }>;
   getDeviceHealthState(): Promise<DeviceHealthState>;
+  setLiveShieldArmed(options: {
+    armed: boolean;
+    policy: LiveShieldPolicy;
+    blockedDomains: string[];
+  }): Promise<NativeLiveShieldSnapshot>;
+  getLiveShieldSnapshot(): Promise<NativeLiveShieldSnapshot>;
+  syncBlockedDomains(options: {
+    policy: LiveShieldPolicy;
+    blockedDomains: string[];
+  }): Promise<{ syncedCount: number }>;
   putEncryptedString(options: { key: string; value: string }): Promise<{ saved: boolean }>;
   getEncryptedString(options: { key: string }): Promise<{ value: string | null }>;
   consumePendingInterceptUrl(): Promise<NativePendingIntentResponse>;
+  addListener(
+    eventName: 'shieldAlert',
+    listenerFunc: (event: IntrusionEvent) => void
+  ): Promise<PluginListenerHandle>;
 }
 
 export const AegisSecurityNative = registerPlugin<AegisSecurityPluginContract>('AegisSecurity');

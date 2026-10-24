@@ -23,11 +23,15 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.log2
 
 /**
  * Local on-device loopback VpnService (tun0 10.215.173.1/30).
- * Inspects outbound DNS QNAMEs locally in memory and forwards clean queries
- * directly via protected physical sockets without external VPN server routing.
+ * Acts as a zero-server DNS Threat Sinkhole: blocks Punycode homographs, RAT Dynamic DNS C2s,
+ * high-entropy DGA / DNS-tunneling queries, and user-blocked domains with NXDOMAIN locally,
+ * while forwarding clean queries to Malware-Blocking resolvers (1.1.1.2 / 9.9.9.9).
  */
 class LocalLoopbackVpnService : VpnService() {
 
@@ -42,12 +46,60 @@ class LocalLoopbackVpnService : VpnService() {
         const val ACTION_STOP = "com.aegislocal.security.STOP_LOCAL_VPN"
         private const val CHANNEL_ID = "aegis_local_vpn_channel"
         private const val NOTIFICATION_ID = 4101
-        private const val UPSTREAM_DNS = "1.1.1.1"
+        private const val PRIMARY_MALWARE_DNS = "1.1.1.2"
+        private const val FALLBACK_MALWARE_DNS = "9.9.9.9"
         private const val VIRTUAL_DNS_INTERCEPT = "10.215.173.2"
+
+        private val DYNAMIC_DNS_C2_SUFFIXES = listOf(
+            "duckdns.org",
+            "ddns.net",
+            "no-ip.org",
+            "no-ip.biz",
+            "hopto.org",
+            "zapto.org",
+            "sytes.net",
+            "myftp.biz",
+            "myftp.org",
+            "servehttp.com",
+            "onion.ws",
+            "tor2web.org"
+        )
+
+        private val customBlockedDomains: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+        @Volatile
+        var dgaEntropyGuardEnabled: Boolean = true
+
+        @Volatile
+        var punycodeHomographBlockEnabled: Boolean = true
+
+        @Volatile
+        var dynamicDnsC2BlockEnabled: Boolean = true
 
         @Volatile
         var isTunnelRunning: Boolean = false
             private set
+
+        val inspectedDnsCount = AtomicLong(0L)
+        val blockedDnsCount = AtomicLong(0L)
+
+        @Volatile
+        var onThreatSinkholed: ((domain: String, reason: String) -> Unit)? = null
+
+        fun updateSinkholePolicy(
+            dgaGuard: Boolean,
+            punycodeBlock: Boolean,
+            ddnsBlock: Boolean,
+            blockedDomains: Collection<String>
+        ) {
+            dgaEntropyGuardEnabled = dgaGuard
+            punycodeHomographBlockEnabled = punycodeBlock
+            dynamicDnsC2BlockEnabled = ddnsBlock
+            customBlockedDomains.clear()
+            blockedDomains.map { it.trim().lowercase() }
+                .filter { it.isNotEmpty() }
+                .forEach { customBlockedDomains.add(it) }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -73,16 +125,16 @@ class LocalLoopbackVpnService : VpnService() {
         val manager = getSystemService(NotificationManager::class.java)
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "AegisLocal Loopback DNS Guard",
+            "AegisLocal Live Shield DNS Sinkhole",
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "On-device DNS & rogue Wi-Fi MITM guard (no external server routing)"
+            description = "On-device anti-intrusion DNS sinkhole & malware guard (zero external routing)"
         }
         manager.createNotificationChannel(channel)
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("AegisLocal Loopback Guard Active")
-            .setContentText("Inspecting DNS locally on tun0 · Zero external traffic routing")
+            .setContentTitle("AegisLocal Live Shield Active")
+            .setContentText("Sinkholing C2, DGA & phishing DNS on tun0 · Resolver 1.1.1.2")
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setOngoing(true)
             .build()
@@ -109,7 +161,7 @@ class LocalLoopbackVpnService : VpnService() {
         }
 
         val builder = Builder()
-            .setSession("AegisLocal On-Device DNS Guard")
+            .setSession("AegisLocal Live Shield")
             .setMtu(1500)
             .addAddress("10.215.173.1", 30)
             .addDnsServer(VIRTUAL_DNS_INTERCEPT)
@@ -160,30 +212,48 @@ class LocalLoopbackVpnService : VpnService() {
         packet.get(dnsBytes)
 
         val queriedDomain = parseDnsQName(dnsBytes)
-        if (queriedDomain != null && isLocallyBlockedPhishingDomain(queriedDomain)) {
-            val nxResponse = synthesizeDnsNxDomainFrame(packet, ipHeaderLen, dnsBytes)
-            tunOutput.write(nxResponse)
-            return
+        if (queriedDomain != null) {
+            inspectedDnsCount.incrementAndGet()
+            val blockReason = evaluateDomainSinkholeReason(queriedDomain)
+            if (blockReason != null) {
+                blockedDnsCount.incrementAndGet()
+                runCatching { onThreatSinkholed?.invoke(queriedDomain, blockReason) }
+                val nxResponse = synthesizeDnsNxDomainFrame(packet, ipHeaderLen, dnsBytes)
+                tunOutput.write(nxResponse)
+                return
+            }
         }
 
-        DatagramSocket().use { upstreamSocket ->
-            if (!protect(upstreamSocket)) return
-            upstreamSocket.soTimeout = 2500
-            val outReq = DatagramPacket(
-                dnsBytes,
-                dnsBytes.size,
-                InetAddress.getByName(UPSTREAM_DNS),
-                53
-            )
-            upstreamSocket.send(outReq)
+        val replyPayload = forwardToMalwareBlockingDns(dnsBytes, PRIMARY_MALWARE_DNS)
+            ?: forwardToMalwareBlockingDns(dnsBytes, FALLBACK_MALWARE_DNS)
+            ?: return
 
-            val respBuf = ByteArray(1500)
-            val inResp = DatagramPacket(respBuf, respBuf.size)
-            upstreamSocket.receive(inResp)
+        val wrappedIpUdp = buildIpv4UdpReply(packet, ipHeaderLen, replyPayload.first, replyPayload.second)
+        tunOutput.write(wrappedIpUdp)
+    }
 
-            val wrappedIpUdp = buildIpv4UdpReply(packet, ipHeaderLen, respBuf, inResp.length)
-            tunOutput.write(wrappedIpUdp)
-        }
+    private fun forwardToMalwareBlockingDns(
+        dnsBytes: ByteArray,
+        upstreamIp: String
+    ): Pair<ByteArray, Int>? {
+        return runCatching {
+            DatagramSocket().use { upstreamSocket ->
+                if (!protect(upstreamSocket)) return null
+                upstreamSocket.soTimeout = 2200
+                val outReq = DatagramPacket(
+                    dnsBytes,
+                    dnsBytes.size,
+                    InetAddress.getByName(upstreamIp),
+                    53
+                )
+                upstreamSocket.send(outReq)
+
+                val respBuf = ByteArray(1500)
+                val inResp = DatagramPacket(respBuf, respBuf.size)
+                upstreamSocket.receive(inResp)
+                Pair(respBuf, inResp.length)
+            }
+        }.getOrNull()
     }
 
     private fun parseDnsQName(dnsPayload: ByteArray): String? {
@@ -199,8 +269,54 @@ class LocalLoopbackVpnService : VpnService() {
         return labels.joinToString(".").lowercase().takeIf { it.isNotEmpty() }
     }
 
-    private fun isLocallyBlockedPhishingDomain(domain: String): Boolean {
-        return domain.startsWith("xn--") && (domain.contains("pypal") || domain.contains("gogle"))
+    private fun evaluateDomainSinkholeReason(domain: String): String? {
+        for (blocked in customBlockedDomains) {
+            if (domain == blocked || domain.endsWith(".$blocked")) {
+                return "Sinkholed by custom encrypted blocklist rule ($blocked)"
+            }
+        }
+
+        val labels = domain.split('.')
+        if (punycodeHomographBlockEnabled && labels.any { it.startsWith("xn--") }) {
+            return "Blocked Punycode IDN homograph DNS query ($domain)"
+        }
+
+        if (dynamicDnsC2BlockEnabled) {
+            val matchedDdns = DYNAMIC_DNS_C2_SUFFIXES.firstOrNull { suffix ->
+                domain == suffix || domain.endsWith(".$suffix")
+            }
+            if (matchedDdns != null) {
+                return "Blocked Dynamic DNS RAT/stalkerware C2 endpoint ($matchedDdns)"
+            }
+        }
+
+        if (dgaEntropyGuardEnabled && labels.size >= 2) {
+            val sub = labels.first()
+            val hasMix = sub.any { it.isDigit() } && sub.any { it.isLetter() }
+            if (sub.length >= 16) {
+                val entropy = calculateShannonEntropy(sub)
+                if ((entropy >= 3.85 && hasMix) || (sub.length >= 24 && entropy >= 3.95)) {
+                    return "Blocked high-entropy DGA / DNS tunneling beacon (${"%.2f".format(entropy)} bits/char)"
+                }
+            }
+        }
+
+        return null
+    }
+
+    private fun calculateShannonEntropy(label: String): Double {
+        if (label.isEmpty()) return 0.0
+        val counts = HashMap<Char, Int>()
+        for (c in label) {
+            counts[c] = (counts[c] ?: 0) + 1
+        }
+        val len = label.length.toDouble()
+        var entropy = 0.0
+        for (count in counts.values) {
+            val p = count / len
+            entropy -= p * log2(p)
+        }
+        return entropy
     }
 
     private fun synthesizeDnsNxDomainFrame(

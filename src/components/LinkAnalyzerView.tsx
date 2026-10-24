@@ -1,78 +1,65 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
-  CheckCircle2,
-  ExternalLink,
-  ShieldBan,
   ArrowRight,
+  CheckCircle2,
+  ClipboardPaste,
+  ExternalLink,
+  Link2,
   Loader2,
+  ShieldBan,
+  Trash2,
 } from 'lucide-react';
 import { RedirectHop, ThreatSeverity, UrlAnalysisResult } from '../security/types';
 import { analyzeUrlSafety } from '../security/urlAnalyzer';
-import { URL_TEST_VECTORS } from '../data/seedData';
 import { AegisSecurityNative, isRunningOnAndroidNative } from '../native/aegisBridge';
 
 interface LinkAnalyzerViewProps {
   recentAnalyses: UrlAnalysisResult[];
   onRecordAnalysis: (result: UrlAnalysisResult) => void;
+  onClearHistory: () => void;
   interceptedIntent?: { url: string; caller: string } | null;
 }
 
 export function LinkAnalyzerView({
   recentAnalyses,
   onRecordAnalysis,
+  onClearHistory,
   interceptedIntent,
 }: LinkAnalyzerViewProps) {
-  const [urlInput, setUrlInput] = useState(interceptedIntent?.url ?? URL_TEST_VECTORS[0].url);
+  const [urlInput, setUrlInput] = useState(interceptedIntent?.url ?? '');
   const [sourceCaller, setSourceCaller] = useState(
-    interceptedIntent?.caller ?? URL_TEST_VECTORS[0].sourceApp
+    interceptedIntent?.caller ?? 'Manual Inspection'
   );
   const [isExpanding, setIsExpanding] = useState(false);
-  const [activeResult, setActiveResult] = useState<UrlAnalysisResult>(() =>
-    interceptedIntent
-      ? analyzeUrlSafety(interceptedIntent.url)
-      : analyzeUrlSafety(
-          URL_TEST_VECTORS[0].url,
-          [
-            {
-              step: 1,
-              url: 'https://bit.ly/3xCorpAuth',
-              statusCode: 301,
-              location: 'https://t.co/redirect-gateway-99',
-              latencyMs: 42,
-            },
-            {
-              step: 2,
-              url: 'https://t.co/redirect-gateway-99',
-              statusCode: 302,
-              location: 'https://xn--pypal-4ve.com/signin/session-verify',
-              latencyMs: 68,
-            },
-            {
-              step: 3,
-              url: 'https://xn--pypal-4ve.com/signin/session-verify',
-              statusCode: 200,
-              contentType: 'text/html; charset=utf-8',
-              latencyMs: 95,
-            },
-          ],
-          'https://xn--pypal-4ve.com/signin/session-verify',
-          'deterministic-vector'
-        )
+  const [activeResult, setActiveResult] = useState<UrlAnalysisResult | null>(() =>
+    interceptedIntent ? analyzeUrlSafety(interceptedIntent.url) : null
   );
+  const [validationError, setValidationError] = useState<string | null>(null);
   const [interceptorFeedback, setInterceptorFeedback] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (interceptedIntent?.url) {
+      setUrlInput(interceptedIntent.url);
+      setSourceCaller(interceptedIntent.caller);
+      void runFullAnalysis(interceptedIntent.url);
+    }
+  }, [interceptedIntent]);
 
   const runFullAnalysis = async (targetUrl: string) => {
     setInterceptorFeedback(null);
     const trimmed = targetUrl.trim();
 
-    // Validate locally first before making network hop request
     const preliminary = analyzeUrlSafety(trimmed);
     if (!preliminary.validSyntax) {
-      setActiveResult(preliminary);
+      setValidationError(
+        preliminary.errorMessage ?? 'Enter a valid URL including http:// or https://.'
+      );
+      setActiveResult(null);
       return;
     }
 
+    setValidationError(null);
     setIsExpanding(true);
     try {
       if (isRunningOnAndroidNative()) {
@@ -124,10 +111,19 @@ export function LinkAnalyzerView({
     void runFullAnalysis(urlInput);
   };
 
-  const handleSelectPreset = (url: string, caller: string) => {
-    setUrlInput(url);
-    setSourceCaller(caller);
-    void runFullAnalysis(url);
+  const handlePasteClipboard = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text.trim()) {
+        setUrlInput(text.trim());
+        setSourceCaller('Clipboard');
+        void runFullAnalysis(text.trim());
+      } else {
+        setValidationError('Clipboard does not contain text to analyze.');
+      }
+    } catch {
+      setValidationError('Clipboard read permission was declined; paste the URL directly into the field.');
+    }
   };
 
   return (
@@ -137,7 +133,10 @@ export function LinkAnalyzerView({
         <p className="text-xs font-medium text-slate-500">
           Android ACTION_VIEW Browser Picker Interceptor · Non-WebView Preflight
         </p>
-        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-950">
+        <h1
+          className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-950"
+          style={{ textWrap: 'balance' }}
+        >
           Link Safe-Guard &amp; Homograph URL Analyzer
         </h1>
         <p className="text-sm text-slate-600 leading-relaxed">
@@ -145,25 +144,40 @@ export function LinkAnalyzerView({
         </p>
       </div>
 
-      {/* URL Input & Preset Test Vectors */}
+      {/* URL Input & Live Inspection */}
       <section
         aria-label="URL Verification Input"
         className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-200"
       >
-        <form onSubmit={handleSubmit} className="p-5 sm:p-6 space-y-4">
-          <div>
-            <label htmlFor="url-analyzer-input" className="block text-xs font-semibold text-slate-700 mb-1.5">
-              Incoming External Intent URI (Intent.ACTION_VIEW)
-            </label>
-            <div className="flex flex-col sm:flex-row gap-3">
-              <input
-                id="url-analyzer-input"
-                type="text"
-                value={urlInput}
-                onChange={(e) => setUrlInput(e.target.value)}
-                placeholder="https://bit.ly/... or https://example.com"
-                className="flex-1 h-11 px-3.5 text-sm font-mono bg-slate-50 border border-slate-300 rounded-lg text-slate-950 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:border-blue-600"
-              />
+        <form onSubmit={handleSubmit} className="p-5 sm:p-6 space-y-3">
+          <label
+            htmlFor="url-analyzer-input"
+            className="block text-xs font-semibold text-slate-700"
+          >
+            External Link or Intent URI (http:// or https://)
+          </label>
+          <div className="flex flex-col sm:flex-row gap-2.5">
+            <input
+              id="url-analyzer-input"
+              type="text"
+              value={urlInput}
+              onChange={(e) => {
+                setUrlInput(e.target.value);
+                if (validationError) setValidationError(null);
+              }}
+              placeholder="https://example.com or shortened link"
+              className="flex-1 h-11 px-3.5 text-sm font-mono bg-slate-50 border border-slate-300 rounded-lg text-slate-950 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:border-blue-600"
+            />
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => void handlePasteClipboard()}
+                className="inline-flex items-center justify-center gap-1.5 px-3.5 h-11 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <ClipboardPaste className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>Paste</span>
+              </button>
+
               <button
                 type="submit"
                 disabled={isExpanding}
@@ -179,48 +193,30 @@ export function LinkAnalyzerView({
                 )}
               </button>
             </div>
-            {!activeResult.validSyntax && activeResult.errorMessage && (
-              <p role="alert" className="mt-2 text-xs font-medium text-red-700">
-                {activeResult.errorMessage}
-              </p>
-            )}
           </div>
 
-          {/* Preset Threat & Clean Test Vectors */}
-          <div className="space-y-2">
-            <span className="block text-xs text-slate-500">
-              Load threat vector or benign sample:
-            </span>
-            <div className="flex flex-wrap gap-2">
-              {URL_TEST_VECTORS.map((vec) => {
-                const isSelected = urlInput === vec.url;
-                return (
-                  <button
-                    key={vec.label}
-                    type="button"
-                    onClick={() => handleSelectPreset(vec.url, vec.sourceApp)}
-                    className={`px-3 py-1.5 min-h-[34px] text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                      isSelected
-                        ? 'bg-slate-900 text-white'
-                        : 'bg-slate-100 text-slate-700 hover:bg-slate-200 hover:text-slate-950'
-                    }`}
-                  >
-                    {vec.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+          {validationError && (
+            <p role="alert" className="text-xs font-medium text-red-700">
+              {validationError}
+            </p>
+          )}
         </form>
 
-        {/* Detailed Analysis Grid */}
-        {activeResult.validSyntax && (
+        {/* Empty State vs Detailed Analysis Grid */}
+        {!activeResult ? (
+          <div className="p-10 text-center space-y-2.5">
+            <Link2 className="w-6 h-6 text-slate-400 mx-auto" aria-hidden="true" />
+            <p className="text-sm font-medium text-slate-900">Ready to inspect external links</p>
+            <p className="text-xs text-slate-500 max-w-lg mx-auto">
+              Paste any URL above or select AegisLocal from Android&apos;s browser chooser when tapping links in SMS, email, or messaging apps to verify redirects and domain authenticity before loading a browser.
+            </p>
+          </div>
+        ) : (
           <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200">
             {/* Left 7 cols: Redirect Chain, Homograph Character Breakdown & Heuristics */}
             <div className="lg:col-span-7 divide-y divide-slate-200">
-              {/* Verdict Header */}
               <div className="p-5 sm:p-6 space-y-2">
-                <div className="flex items-center justify-between gap-4">
+                <div className="flex flex-wrap items-center justify-between gap-4">
                   <div className="text-xs text-slate-500">
                     Scheme: <span className="font-mono text-slate-800">{activeResult.scheme}</span> · Registrable Domain:{' '}
                     <span className="font-mono text-slate-800">{activeResult.registrableDomain}</span>
@@ -256,7 +252,7 @@ export function LinkAnalyzerView({
 
                 {activeResult.safeBrowsingCategory && (
                   <p className="text-xs font-mono text-red-700">
-                    Safe Browsing Classification: {activeResult.safeBrowsingCategory}
+                    Threat Signature Classification: {activeResult.safeBrowsingCategory}
                   </p>
                 )}
               </div>
@@ -322,7 +318,7 @@ export function LinkAnalyzerView({
 
                 {activeResult.hops.length === 0 ? (
                   <p className="text-xs text-slate-600">
-                    Evaluated directly without intermediate HTTP 30x redirects.
+                    Evaluated without intermediate HTTP 30x redirects.
                   </p>
                 ) : (
                   <ol className="space-y-2.5 text-xs">
@@ -342,7 +338,9 @@ export function LinkAnalyzerView({
                           </div>
                         )}
                         {hop.contentType && (
-                          <div className="text-slate-500 font-mono">Content-Type: {hop.contentType}</div>
+                          <div className="text-slate-500 font-mono">
+                            Content-Type: {hop.contentType}
+                          </div>
                         )}
                       </li>
                     ))}
@@ -352,7 +350,7 @@ export function LinkAnalyzerView({
 
               {/* Heuristic Findings List */}
               <div className="p-5 sm:p-6 space-y-2.5">
-                <h2 className="text-sm font-bold text-slate-950">Heuristic &amp; Threat Feed Signals</h2>
+                <h2 className="text-sm font-bold text-slate-950">Heuristic &amp; Threat Signals</h2>
                 <ul className="space-y-1.5 text-xs text-slate-700 leading-relaxed list-disc pl-4">
                   {activeResult.findings.map((f, idx) => (
                     <li key={idx}>{f}</li>
@@ -361,26 +359,22 @@ export function LinkAnalyzerView({
               </div>
             </div>
 
-            {/* Right 5 cols: Android LinkInterceptorActivity BottomSheet Simulation */}
+            {/* Right 5 cols: Browser Launch Gate & Encrypted History */}
             <div className="lg:col-span-5 p-5 sm:p-6 bg-slate-50/60 flex flex-col justify-between space-y-6">
               <div className="space-y-4">
                 <div>
                   <h2 className="text-sm font-bold text-slate-950">
-                    Android Intent Filter Overlay Simulation
+                    Browser Launch Gate
                   </h2>
                   <p className="mt-0.5 text-xs text-slate-600">
-                    Preview of LinkInterceptorActivity intercepting ACTION_VIEW from{' '}
-                    <span className="font-medium text-slate-900">{sourceCaller}</span> before Chrome or WebView initializes.
+                    Source: <span className="font-medium text-slate-900">{sourceCaller}</span> · Holds navigation until destination passes local verification.
                   </p>
                 </div>
 
-                {/* Simulated Android Handset BottomSheet Frame (flat clean elevation) */}
                 <div className="bg-slate-900 text-white rounded-2xl p-5 space-y-4">
-                  <div className="w-10 h-1 bg-slate-700 rounded-full mx-auto" aria-hidden="true" />
-
                   <div className="space-y-1">
                     <p className="text-[11px] text-slate-400">
-                      Intercepted from {sourceCaller} · AegisLocal Browser Guard
+                      Source: {sourceCaller} · AegisLocal Browser Guard
                     </p>
                     <h3 className="text-base font-bold text-white">
                       {activeResult.verdictAction === 'BLOCK_INTENT'
@@ -392,7 +386,7 @@ export function LinkAnalyzerView({
                   </div>
 
                   <div className="bg-slate-800/90 rounded-xl p-3.5 space-y-1.5 text-xs">
-                    <div className="text-slate-400">True Final Destination:</div>
+                    <div className="text-slate-400">Resolved Final Destination:</div>
                     <div className="font-mono text-slate-100 break-all">{activeResult.finalUrl}</div>
                     {activeResult.dangerousPayloadExtension && (
                       <div className="text-red-300 font-medium pt-1">
@@ -401,23 +395,17 @@ export function LinkAnalyzerView({
                     )}
                   </div>
 
-                  <div className="space-y-1.5 text-xs text-slate-300">
-                    {activeResult.findings.slice(0, 2).map((item, i) => (
-                      <p key={i}>• {item}</p>
-                    ))}
-                  </div>
-
                   <div className="grid grid-cols-2 gap-2.5 pt-2">
                     <button
                       type="button"
-                      onClick={() =>
-                        setInterceptorFeedback(
-                          'Intent terminated via finish(). Default browser was never spawned.'
-                        )
-                      }
+                      onClick={() => {
+                        setUrlInput('');
+                        setActiveResult(null);
+                        setInterceptorFeedback(null);
+                      }}
                       className="min-h-[42px] px-3 py-2 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-white rounded-xl transition-colors cursor-pointer"
                     >
-                      Close &amp; Block
+                      Block &amp; Clear
                     </button>
 
                     <button
@@ -426,13 +414,15 @@ export function LinkAnalyzerView({
                         if (isRunningOnAndroidNative()) {
                           void AegisSecurityNative.openVerifiedExternalBrowser({
                             url: activeResult.finalUrl,
-                          });
+                          }).catch(() => null);
+                          setInterceptorFeedback('Dispatched verified URL to external Android browser.');
+                        } else {
+                          setInterceptorFeedback(
+                            activeResult.verdictAction === 'ALLOW_BROWSER_LAUNCH'
+                              ? 'Destination verified safe for browser navigation.'
+                              : 'Warning: Link flagged as high risk — external auto-open suppressed.'
+                          );
                         }
-                        setInterceptorFeedback(
-                          activeResult.verdictAction === 'ALLOW_BROWSER_LAUNCH'
-                            ? 'Explicit Intent(ACTION_VIEW) dispatched to external browser.'
-                            : 'User override logged to EncryptedSharedPreferences; explicit browser intent isolated.'
-                        );
                       }}
                       className={`min-h-[42px] px-3 py-2 text-xs font-semibold rounded-xl inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
                         activeResult.verdictAction === 'ALLOW_BROWSER_LAUNCH'
@@ -457,20 +447,33 @@ export function LinkAnalyzerView({
                 </div>
               </div>
 
-              {/* Encrypted Audit History */}
               {recentAnalyses.length > 0 && (
                 <div className="space-y-2 pt-2 border-t border-slate-200">
-                  <h3 className="text-xs font-semibold text-slate-700">
-                    Recent Vault-Logged URL Inspections ({recentAnalyses.length})
-                  </h3>
+                  <div className="flex items-center justify-between gap-2">
+                    <h3 className="text-xs font-semibold text-slate-700">
+                      Vault-Logged URL Inspections ({recentAnalyses.length})
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={onClearHistory}
+                      className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-red-700 cursor-pointer"
+                    >
+                      <Trash2 className="w-3 h-3" aria-hidden="true" />
+                      <span>Clear</span>
+                    </button>
+                  </div>
                   <ul className="space-y-1.5 text-xs">
-                    {recentAnalyses.slice(0, 4).map((item, idx) => (
-                      <li key={`${item.inputUrl}-${idx}`} className="flex items-center justify-between gap-2">
+                    {recentAnalyses.slice(0, 5).map((item, idx) => (
+                      <li
+                        key={`${item.inputUrl}-${idx}`}
+                        className="flex items-center justify-between gap-2"
+                      >
                         <button
                           type="button"
                           onClick={() => {
                             setUrlInput(item.inputUrl);
                             setActiveResult(item);
+                            setValidationError(null);
                           }}
                           className="font-mono text-slate-700 hover:text-blue-700 truncate text-left cursor-pointer"
                         >

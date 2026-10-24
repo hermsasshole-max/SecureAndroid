@@ -1,6 +1,6 @@
 import express from 'express';
 import type { Request, Response } from 'express';
-import dns from 'node:dns/promises';
+import dns, { Resolver } from 'node:dns/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,48 +83,37 @@ async function validatePublicHostname(hostname: string): Promise<{ safe: boolean
   }
 }
 
-// Known deterministic offline shortener simulations for air-gapped testing & security training vectors
-const KNOWN_SIMULATED_CHAINS: Record<string, HopRecord[]> = {
-  'https://bit.ly/3xCorpAuth': [
-    {
-      step: 1,
-      url: 'https://bit.ly/3xCorpAuth',
-      statusCode: 301,
-      location: 'https://t.co/redirect-gateway-99',
-      latencyMs: 42,
-    },
-    {
-      step: 2,
-      url: 'https://t.co/redirect-gateway-99',
-      statusCode: 302,
-      location: 'https://xn--pypal-4ve.com/signin/session-verify',
-      latencyMs: 68,
-    },
-    {
-      step: 3,
-      url: 'https://xn--pypal-4ve.com/signin/session-verify',
-      statusCode: 200,
-      contentType: 'text/html; charset=utf-8',
-      latencyMs: 95,
-    },
-  ],
-  'https://tinyurl.com/android-sec-update': [
-    {
-      step: 1,
-      url: 'https://tinyurl.com/android-sec-update',
-      statusCode: 301,
-      location: 'http://198.51.100.44/updates/SystemPatch_v14.apk',
-      latencyMs: 51,
-    },
-    {
-      step: 2,
-      url: 'http://198.51.100.44/updates/SystemPatch_v14.apk',
-      statusCode: 200,
-      contentType: 'application/vnd.android.package-archive',
-      latencyMs: 112,
-    },
-  ],
-};
+async function probeThreatBlockingDns(): Promise<{
+  reachable: boolean;
+  latencyMs: number | null;
+  resolver: string;
+}> {
+  const resolver = new Resolver({ timeout: 2200, tries: 1 });
+  resolver.setServers(['1.1.1.2', '9.9.9.9']);
+  const start = Date.now();
+  try {
+    const records = await resolver.resolve4('cloudflare-dns.com');
+    const latencyMs = Math.max(1, Date.now() - start);
+    return {
+      reachable: records.length > 0,
+      latencyMs,
+      resolver: '1.1.1.2',
+    };
+  } catch {
+    // Fallback check against system resolver if UDP 53 to public resolvers is egress-restricted
+    const fallbackStart = Date.now();
+    try {
+      const sysRecords = await dns.lookup('cloudflare-dns.com');
+      return {
+        reachable: Boolean(sysRecords.address),
+        latencyMs: Math.max(1, Date.now() - fallbackStart),
+        resolver: 'system-dns',
+      };
+    } catch {
+      return { reachable: false, latencyMs: null, resolver: '1.1.1.2' };
+    }
+  }
+}
 
 async function startServer() {
   const app = express();
@@ -132,21 +121,20 @@ async function startServer() {
 
   app.use(express.json({ limit: '32kb' }));
 
+  app.get('/api/shield-probe', async (_req: Request, res: Response) => {
+    const dnsStatus = await probeThreatBlockingDns();
+    res.json({
+      checkedAtIso: new Date().toISOString(),
+      malwareDnsReachable: dnsStatus.reachable,
+      malwareDnsLatencyMs: dnsStatus.latencyMs,
+      resolver: dnsStatus.resolver,
+    });
+  });
+
   app.post('/api/expand-url', async (req: Request, res: Response) => {
     const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
     if (!rawUrl) {
       res.status(400).json({ error: 'URL is required.' });
-      return;
-    }
-
-    if (KNOWN_SIMULATED_CHAINS[rawUrl]) {
-      const hops = KNOWN_SIMULATED_CHAINS[rawUrl];
-      res.json({
-        mode: 'deterministic-vector',
-        initialUrl: rawUrl,
-        finalUrl: hops[hops.length - 1].url,
-        hops,
-      });
       return;
     }
 
@@ -195,7 +183,7 @@ async function startServer() {
           redirect: 'manual',
           signal: controller.signal,
           headers: {
-            'User-Agent': 'AegisLocal-LinkInspector/1.0 (Android 14; Non-Browser Preflight)',
+            'User-Agent': 'AegisLocal-LinkInspector/1.0 (Android; Non-Browser Preflight)',
             Accept: '*/*',
           },
         });
